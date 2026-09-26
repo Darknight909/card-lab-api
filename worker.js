@@ -1,7 +1,7 @@
-const VERSION = '1.2.0';
+const VERSION = '1.2.1';
 const DEFAULT_ORIGIN = 'https://darknight909.github.io';
 const VISION_MODEL = '@cf/moondream/moondream3.1-9B-A2B';
-const TEXT_MODEL = '@cf/google/gemma-4-26b-a4b-it';
+const TEXT_MODEL = '@cf/meta/llama-3.3-70b-instruct-fp8-fast';
 
 let ebayTokenCache = { token: null, expiresAt: 0 };
 
@@ -204,14 +204,91 @@ Return:
 
   const raw = await env.AI.run(TEXT_MODEL, {
     messages: [
-      { role: 'system', content: 'You are a conservative trading-card identification and pre-grading reconciliation engine. Output strict JSON only.' },
+      { role: 'system', content: 'You are a conservative trading-card identification and pre-grading reconciliation engine. Return one valid JSON object only.' },
       { role: 'user', content: prompt },
     ],
+    response_format: { type: 'json_object' },
     temperature: 0.05,
-    max_completion_tokens: 1800,
+    max_tokens: 1800,
+    stream: false,
   });
-  const result = parseModelJSON(modelText(raw), 'reconciliation');
-  return normalizeAnalysis(result, front, back);
+
+  // Cloudflare JSON Mode may return the structured object under `response`
+  // instead of as plain text. Accept both shapes. If reconciliation ever
+  // fails, fall back to a conservative deterministic merge rather than
+  // throwing away the entire card analysis.
+  try {
+    const result = structuredModelResult(raw, 'reconciliation');
+    return normalizeAnalysis(result, front, back);
+  } catch (e) {
+    console.warn('Reconciliation fallback:', e);
+    return fallbackReconcile(front, back);
+  }
+}
+
+
+function structuredModelResult(raw, label) {
+  if (!raw) throw new Error(`${label} returned no result.`);
+  if (raw.response && typeof raw.response === 'object' && !Array.isArray(raw.response)) return raw.response;
+  if (raw.result && typeof raw.result === 'object' && !Array.isArray(raw.result)) return raw.result;
+  const msg = raw.choices?.[0]?.message;
+  if (msg?.parsed && typeof msg.parsed === 'object') return msg.parsed;
+  if (typeof msg?.content === 'string') return parseModelJSON(msg.content, label);
+  if (typeof raw.response === 'string') return parseModelJSON(raw.response, label);
+  if (typeof raw.answer === 'string') return parseModelJSON(raw.answer, label);
+  return parseModelJSON(modelText(raw), label);
+}
+
+function fallbackReconcile(front, back) {
+  const fi = front?.identity || {}, bi = back?.identity || {};
+  const fc = front?.condition || {}, bc = back?.condition || {};
+  const choose = (a, b) => clean(a) || clean(b) || null;
+  const worse = (a, b, d = 5) => {
+    const vals = [Number(a), Number(b)].filter(Number.isFinite);
+    return clampHalf(vals.length ? Math.min(...vals) : d, 1, 10);
+  };
+  const defects = {};
+  for (const k of ['crease','dent','stain','scratch','printline','mark','possible_alteration']) {
+    defects[k] = Boolean(fc.defects?.[k] || bc.defects?.[k]);
+  }
+  const years = [...(fi.years_seen || []), ...(bi.years_seen || [])];
+  let year = Number(bi.release_year || fi.release_year) || null;
+  // If the card itself says it is a 35th-anniversary treatment of a 1991 design,
+  // 1991 + 35 = 2026 is a strong product-year clue. This also prevents a 2025
+  // statistics heading from being mistaken for the release year.
+  const clues = [fi.exact_set_or_insert, bi.exact_set_or_insert, ...(fi.set_clues||[]), ...(bi.set_clues||[]), ...(fi.visible_text||[]), ...(bi.visible_text||[])].join(' ');
+  if (/35(?:th)?\s+anniversary/i.test(clues) && /1991/i.test(clues)) year = 2026;
+  if (!year) {
+    const release = years.find(x => x?.role === 'release');
+    if (release?.year) year = Number(release.year);
+  }
+  return normalizeAnalysis({
+    identity: {
+      year,
+      brand: choose(bi.brand, fi.brand),
+      set: choose(bi.exact_set_or_insert, fi.exact_set_or_insert),
+      subject: choose(bi.subject, fi.subject),
+      cardNo: choose(bi.card_number, fi.card_number),
+      variation: choose(bi.variation_or_parallel, fi.variation_or_parallel),
+      team: choose(bi.team_or_affiliation, fi.team_or_affiliation),
+      category: bi.category || fi.category || 'Other',
+    },
+    condition: {
+      corners: worse(fc.corners, bc.corners),
+      edges: worse(fc.edges, bc.edges),
+      surface: worse(fc.surface, bc.surface),
+      focus: worse(fc.focus_registration, bc.focus_registration),
+      front: { lr: fc.centering_lr || null, tb: fc.centering_tb || null },
+      back: { lr: bc.centering_lr || null, tb: bc.centering_tb || null },
+      defects,
+      notes: ['Automatic reconciliation used the conservative fallback because the structured AI response could not be read.'],
+    },
+    identity_confidence: 55,
+    condition_confidence: 45,
+    evidence: ['Front/back vision reads were merged conservatively.'],
+    needs_review: true,
+    review_reason: 'Structured reconciliation fallback used; verify identity before professional grading.',
+  }, front, back);
 }
 
 function normalizeAnalysis(a, front, back) {

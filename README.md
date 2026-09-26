@@ -1,4 +1,4 @@
-# Card Lab API v1.2 — Cloudflare Worker
+# Card Lab API v1.2.1 — Cloudflare Worker
 
 This Worker receives the front/back card photos, uses Cloudflare Workers AI transiently, reconciles the identity and visible condition, and optionally searches current eBay listings if eBay Developer credentials are configured.
 
@@ -21,3 +21,7 @@ Without these, identification/grading still works and the app opens a normal cur
 Create a Worker named `card-lab-api`, replace the starter code with worker.js, add the Workers AI binding and secrets/variable above, deploy, then copy the `https://...workers.dev` URL into Card Lab > Settings.
 
 Do not store photos in KV/R2/D1 unless you intentionally add cloud storage later. This Worker itself does not persist photos.
+
+
+## v1.2.1 fix
+Uses a JSON-Mode-supported reconciliation model and accepts Cloudflare structured `response` objects. If reconciliation still fails, it falls back to a conservative merge instead of failing the whole analysis.
