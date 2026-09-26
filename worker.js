@@ -1,6 +1,6 @@
-const VERSION = '1.4.2';
+const VERSION = '1.4.3';
 const DEFAULT_ORIGIN = 'https://darknight909.github.io';
-const VISION_MODEL = '@cf/google/gemma-4-26b-a4b-it';
+const VISION_MODEL = '@cf/moondream/moondream3.1-9B-A2B';
 const TEXT_MODEL = '@cf/meta/llama-3.3-70b-instruct-fp8-fast';
 
 let ebayTokenCache = { token: null, expiresAt: 0 };
@@ -143,16 +143,23 @@ function validateImage(value, label) {
 }
 
 async function inspectSide(env, side, image) {
-  const question = `Inspect the ${side} of ONE raw collectible trading card from the photo.
+  const question = `Inspect the ${side} of ONE raw collectible trading card from this image.
 
-Return SIMPLE KEY=VALUE lines, one field per line. Do NOT return JSON or markdown.
-If a value cannot be determined, use UNKNOWN. Do not invent text.
+Return SIMPLE KEY=VALUE lines, one field per line. Do NOT return markdown. If a value cannot be determined, use UNKNOWN. Never invent text.
 
-YEAR RULE: a stats season (example: 2025 RECEIVING STATS), birth year, draft year, copyright year, anniversary year, or throwback design year is NOT automatically the product release year.
-CARD NUMBER RULE: codes such as 91TF-2, US175, RA-TH, #123 are strong identity clues. Do NOT use a jersey/uniform number as the card number.
-${side === 'back' ? 'BACK PRIORITY: read the card code near the top, player/team line, manufacturer logo, copyright/legal line, and any set/insert wording.' : 'FRONT PRIORITY: read player/subject, team, manufacturer/logo, anniversary/set clues, and any card code.'}
-Condition scores are 1-10 in 0.5 increments and must reflect only what is actually visible in this photo.
-Centering is larger-side-first percentages, e.g. 55/45. Use UNKNOWN when borderless or unreliable.
+IDENTITY PRIORITY:
+1) Read exact card code/number, especially alphanumeric codes such as 91TF-2, US175, RA-TH.
+2) Read player/subject name and team.
+3) Read manufacturer/brand logo such as Topps, Panini, Bowman, Upper Deck.
+4) Read insert/set clues such as 35th Anniversary, Chrome, Prizm, etc.
+5) Read copyright/release information separately from statistics years.
+
+YEAR RULE: a stats season, birth year, draft year, or throwback design year is NOT automatically the product release year.
+CARD NUMBER RULE: never use a jersey/uniform number as the card number.
+
+CONDITION PRIORITY:
+Evaluate only what is visible in this photo. Use 1-10 in 0.5 increments for corners, edges, surface, and focus. If you cannot judge one reliably, use UNKNOWN. Do not assign a very low score unless visible damage supports it.
+Centering must be larger-side-first percentages such as 55/45. Use UNKNOWN if borderless or unreliable.
 
 Use exactly these keys:
 SIDE=${side}
@@ -177,48 +184,62 @@ CONFIDENCE=
 VISIBLE_TEXT=
 NOTES=
 
-YEARS_SEEN format example: 2025:stats;2026:copyright
+YEARS_SEEN example: 2025:stats;2026:copyright
 DEFECTS: comma-separated from crease,dent,stain,scratch,printline,mark,possible_alteration, or NONE.
 CATEGORY: Sports, TCG, Non-sport, or Other.
-VISIBLE_TEXT: semicolon-separated exact snippets you can read.`;
+VISIBLE_TEXT: semicolon-separated exact snippets you can actually read.`;
 
   const raw = await env.AI.run(VISION_MODEL, {
-    messages: [
-      { role: 'system', content: 'You are a precise trading-card OCR and condition-inspection engine. Follow the requested KEY=VALUE format. Never invent text.' },
-      { role: 'user', content: question },
-    ],
+    task: 'query',
     image,
-    chat_template_kwargs: { enable_thinking: false },
-    temperature: 0.02,
-    max_tokens: 1600,
+    question,
+    reasoning: false,
+    temperature: 0,
+    max_tokens: 1800,
     stream: false,
   });
 
   const text = modelText(raw);
-  // Accept JSON too if the model happens to emit it, but do not depend on JSON.
-  try {
-    const parsed = parseModelJSON(text, `${side} vision`);
-    if (parsed && typeof parsed === 'object' && parsed.identity && parsed.condition) return parsed;
-  } catch {}
-
   const kv = parseVisionKV(text, side);
-  if (visionReadHasUsefulClues(kv)) return kv;
+  if (visionReadHasUsefulClues(kv)) {
+    sanitizeConditionRead(kv);
+    return kv;
+  }
 
-  // Last-resort OCR pass: plain transcription is easier for a vision model than
-  // structured output. It still gives the web verifier card codes/names to search.
+  // OCR fallback: ask the OCR-focused model for plain transcription only.
   const ocrRaw = await env.AI.run(VISION_MODEL, {
-    messages: [
-      { role: 'system', content: 'Transcribe visible trading-card text accurately. Do not explain.' },
-      { role: 'user', content: `Transcribe every legible word, number, card code, logo/brand name, player name, team name, and copyright line from the ${side} of this card. Plain text only.` },
-    ],
+    task: 'query',
     image,
-    chat_template_kwargs: { enable_thinking: false },
+    question: `Transcribe every legible word, number, card code, logo/brand name, player name, team name, anniversary/set wording, and copyright line from the ${side} of this trading card. Plain text only. Do not guess.`,
+    reasoning: false,
     temperature: 0,
-    max_tokens: 1200,
+    max_tokens: 1400,
     stream: false,
   });
   const transcript = modelText(ocrRaw).trim();
   return fallbackVisionRead(transcript || text, side);
+}
+
+function sanitizeConditionRead(r) {
+  const c = r?.condition;
+  if (!c) return r;
+  for (const k of ['corners','edges','surface','focus_registration']) {
+    const v = Number(c[k]);
+    if (!Number.isFinite(v) || v < 1 || v > 10) c[k] = null;
+    else c[k] = clampHalf(v, 1, 10);
+  }
+  const flags = c.defects || {};
+  const anyFlag = Object.values(flags).some(Boolean);
+  const vals = ['corners','edges','surface','focus_registration'].map(k=>c[k]).filter(v=>Number.isFinite(Number(v)));
+  // A model occasionally emits four 1s as a malformed/fallback answer. If the same
+  // response reports no visible defects, withhold condition scoring instead of
+  // inventing a damaged-card grade.
+  if (vals.length === 4 && vals.every(v=>Number(v)===1) && !anyFlag) {
+    c.corners=c.edges=c.surface=c.focus_registration=null;
+    c.photo_confidence=Math.min(Number(c.photo_confidence)||35,35);
+    c.notes=Array.from(new Set([...(c.notes||[]),'Condition scores withheld because the vision response was internally inconsistent.']));
+  }
+  return r;
 }
 
 function visionReadHasUsefulClues(r) {

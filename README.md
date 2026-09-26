@@ -1,4 +1,4 @@
-Card Lab Cloudflare Worker v1.4.2
+Card Lab Cloudflare Worker v1.4.3
 
 Fixes the repeated "front vision returned an unreadable response" failure.
 
@@ -13,3 +13,8 @@ Files:
 - worker.js
 - wrangler.jsonc
 - README.md
+
+
+### v1.4.3
+- Switched image OCR/inspection to Cloudflare Moondream 3.1, an image-to-text model optimized for OCR and structured visual queries.
+- Added condition sanity checks so malformed all-1 scores do not produce fake low grades.
