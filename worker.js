@@ -1,4 +1,4 @@
-const VERSION = '1.3.0';
+const VERSION = '1.3.1';
 const DEFAULT_ORIGIN = 'https://darknight909.github.io';
 const VISION_MODEL = '@cf/moondream/moondream3.1-9B-A2B';
 const TEXT_MODEL = '@cf/meta/llama-3.3-70b-instruct-fp8-fast';
@@ -679,7 +679,7 @@ function extractCardCodeFromText(text) {
 function detectBrandFromText(text) {
   const t = String(text || '');
   for (const b of ['Topps','Panini','Bowman','Upper Deck','Fleer','Donruss','Score','Leaf']) {
-    if (new RegExp(`\b${escapeRegex(b)}\b`, 'i').test(t)) return b;
+    if (new RegExp(`\\b${escapeRegex(b)}\\b`, 'i').test(t)) return b;
   }
   return null;
 }
@@ -690,7 +690,7 @@ function extractSubjectFromBest(best, front, back) {
   return known[0] || null;
 }
 
-function escapeRegex(s) { return String(s || '').replace(/[.*+?^${}()|[\]\]/g, '\$&'); }
+function escapeRegex(s) { return String(s || '').replace(/[.*+?^${}()|[\]\\]/g, '\\$&'); }
 
 async function ebaySearch(env, query) {
   if (!query) return { configured: true, items: [], query };
