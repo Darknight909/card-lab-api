@@ -1,4 +1,4 @@
-const VERSION = '1.2.5';
+const VERSION = '1.3.0';
 const DEFAULT_ORIGIN = 'https://darknight909.github.io';
 const VISION_MODEL = '@cf/moondream/moondream3.1-9B-A2B';
 const TEXT_MODEL = '@cf/meta/llama-3.3-70b-instruct-fp8-fast';
@@ -17,7 +17,7 @@ export default {
 
     const url = new URL(request.url);
     if (url.pathname === '/health' && request.method === 'GET') {
-      return json({ ok: true, service: 'Card Lab API', version: VERSION, ebayConfigured: Boolean(env.EBAY_CLIENT_ID && env.EBAY_CLIENT_SECRET) }, 200, cors);
+      return json({ ok: true, service: 'Card Lab API', version: VERSION, ebayConfigured: Boolean(env.EBAY_CLIENT_ID && env.EBAY_CLIENT_SECRET), tavilyConfigured: Boolean(env.TAVILY_API_KEY) }, 200, cors);
     }
 
     if (origin && origin !== allowedOrigin) {
@@ -46,32 +46,44 @@ export default {
         inspectSide(env, 'back', back),
       ]);
 
-      // Keep analysis to two image-model calls (front + back) for better
-      // reliability on mobile. Back-side identity marks are requested directly
-      // in the normal back read instead of using a third serial AI call.
+      // Step 1: extract clues from the two photos.
       const provisional = provisionalIdentity(frontRead, backRead, null);
-      let ebay = { configured: false, items: [], query: buildQuery(provisional) };
-      if (env.EBAY_CLIENT_ID && env.EBAY_CLIENT_SECRET) {
+
+      // Step 2: verify those clues against the live web. Only text clues are
+      // sent to Tavily; the card photos themselves are NOT sent to Tavily.
+      let webLookup = { configured: Boolean(env.TAVILY_API_KEY), used: false, query: '', results: [], answer: null };
+      if (env.TAVILY_API_KEY) {
         try {
-          ebay = await ebaySearch(env, buildQuery(provisional));
+          webLookup = await tavilyCardLookup(env, provisional, frontRead, backRead);
         } catch (e) {
-          ebay = { configured: true, items: [], query: buildQuery(provisional), error: String(e?.message || e) };
+          webLookup = { configured: true, used: true, query: buildLookupQuery(provisional, frontRead, backRead), results: [], answer: null, error: String(e?.message || e) };
         }
       }
 
-      // Reliability-first path: avoid a third AI reconciliation call. The two
-      // image reads are merged deterministically, then guarded by card-code,
-      // brand and year rules. This materially reduces long-request failures
-      // seen in iOS web apps while keeping identity evidence visible.
+      // Step 3: merge the visual evidence conservatively, then allow a strong
+      // online match to fill/correct identity fields. Condition/grading data
+      // always comes from the photos, never from web listings.
       const merged = fallbackReconcile(frontRead, backRead);
-      const analysis = guardIdentity(merged, frontRead, backRead, null);
+      const guarded = guardIdentity(merged, frontRead, backRead, null);
+      const analysis = applyWebIdentity(guarded, webLookup, frontRead, backRead);
       analysis.identity_confidence = Math.max(analysis.identity_confidence || 0,
-        analysis.identity?.cardNo && analysis.identity?.subject ? 78 : 60);
+        analysis.web_match?.score >= 18 ? 92 : analysis.identity?.cardNo && analysis.identity?.subject ? 78 : 60);
       analysis.condition_confidence = Math.max(analysis.condition_confidence || 0, 60);
-      if (analysis.identity?.cardNo && analysis.identity?.subject && analysis.identity?.brand) {
-        analysis.evidence = Array.from(new Set([...(analysis.evidence || []), 'Front/back reads merged without a third AI call for mobile reliability.']));
-      }
+      analysis.evidence = Array.from(new Set([
+        ...(analysis.evidence || []),
+        'Front/back photos used for condition analysis.',
+        ...(webLookup.used ? ['Online lookup used to verify card identity from extracted text clues.'] : [])
+      ])).slice(0, 10);
+
       const query = buildQuery(analysis.identity || provisional);
+      let ebay = { configured: false, items: [], query };
+      if (env.EBAY_CLIENT_ID && env.EBAY_CLIENT_SECRET) {
+        try {
+          ebay = await ebaySearch(env, query);
+        } catch (e) {
+          ebay = { configured: true, items: [], query, error: String(e?.message || e) };
+        }
+      }
 
       // If the refined identity materially differs, refresh eBay once.
       if (env.EBAY_CLIENT_ID && env.EBAY_CLIENT_SECRET && query && query !== ebay.query) {
@@ -87,7 +99,8 @@ export default {
           query,
           searchUrl: query ? `https://www.ebay.com/sch/i.html?_nkw=${encodeURIComponent(query)}` : 'https://www.ebay.com/',
         },
-        privacy: 'Images were sent to Cloudflare Workers AI for this analysis. This Worker does not save them to KV, R2, D1, or Durable Objects.',
+        webLookup: { configured: webLookup.configured, used: webLookup.used, query: webLookup.query, results: (webLookup.results || []).slice(0, 5) },
+        privacy: 'Images were sent to Cloudflare Workers AI for visual analysis. Tavily receives only extracted text clues/search terms, not the card images. This Worker does not save images to KV, R2, D1, or Durable Objects.',
       }, 200, cors);
     } catch (e) {
       console.error(e);
@@ -518,6 +531,166 @@ function parseModelJSON(text, label) {
 function buildQuery(i = {}) {
   return [i.year, i.brand, i.set, i.subject, i.cardNo, i.variation].filter(Boolean).join(' ').replace(/\s+/g, ' ').trim();
 }
+
+
+async function tavilyCardLookup(env, provisional, front, back) {
+  const query = buildLookupQuery(provisional, front, back);
+  if (!query) return { configured: true, used: false, query: '', results: [], answer: null };
+  const r = await fetch('https://api.tavily.com/search', {
+    method: 'POST',
+    headers: {
+      'Authorization': `Bearer ${env.TAVILY_API_KEY}`,
+      'Content-Type': 'application/json',
+      'Accept': 'application/json',
+    },
+    body: JSON.stringify({
+      query,
+      topic: 'general',
+      search_depth: 'basic',
+      max_results: 8,
+      include_answer: true,
+      include_raw_content: false,
+      include_images: false,
+    }),
+  });
+  if (!r.ok) {
+    const t = await r.text().catch(() => '');
+    throw new Error(`Tavily search ${r.status}${t ? `: ${t.slice(0, 180)}` : ''}`);
+  }
+  const j = await r.json();
+  return {
+    configured: true, used: true, query, answer: clean(j.answer),
+    results: (j.results || []).slice(0, 8).map(x => ({
+      title: clean(x.title), url: clean(x.url), content: clean(x.content), score: Number(x.score) || 0,
+    })),
+  };
+}
+
+function buildLookupQuery(i = {}, front, back) {
+  const text = allReadText(front, back).join(' ');
+  const clues = [];
+  if (i.cardNo) clues.push(`"${i.cardNo}"`);
+  if (i.subject) clues.push(`"${i.subject}"`);
+  if (i.brand) clues.push(i.brand);
+  if (i.set) clues.push(`"${i.set}"`);
+  if (/35(?:th)?\s*anniversary/i.test(text)) clues.push('35th Anniversary');
+  if (/football/i.test(text)) clues.push('football card');
+  else if (/basketball/i.test(text)) clues.push('basketball card');
+  else if (/baseball/i.test(text)) clues.push('baseball card');
+  else clues.push('trading card');
+  clues.push('checklist exact card number set year');
+  return clues.join(' ').replace(/\s+/g, ' ').trim().slice(0, 390);
+}
+
+function applyWebIdentity(analysis, web, front, back) {
+  const out = structuredClone(analysis);
+  if (!web?.used || !(web.results || []).length) return out;
+  const base = out.identity || {};
+  const scored = web.results.map(r => ({ ...r, matchScore: scoreWebResult(r, base, front, back) }))
+    .sort((a,b) => b.matchScore - a.matchScore || b.score - a.score);
+  const best = scored[0];
+  if (!best || best.matchScore < 8) {
+    out.needs_review = true;
+    out.review_reason = cleanJoin(out.review_reason, 'Online search did not find a strong exact-card match.');
+    return out;
+  }
+
+  const evidenceText = [best.title, best.content, web.answer].filter(Boolean).join(' | ');
+  const cardNo = base.cardNo || extractCardCodeFromText(evidenceText);
+  const subject = base.subject || extractSubjectFromBest(best, front, back);
+  const brand = normalizeBrand(base.brand || detectBrandFromText(evidenceText));
+  const year = chooseWebYear(best, web.answer, base.year, cardNo, subject);
+  const set = chooseWebSet(best, brand, year, subject, cardNo, base.set);
+
+  if (cardNo) base.cardNo = cardNo;
+  if (subject) base.subject = subject;
+  if (brand) base.brand = brand;
+  if (year) base.year = year;
+  if (set) base.set = set;
+
+  out.identity = base;
+  out.web_match = {
+    score: best.matchScore, title: best.title, url: best.url,
+  };
+  if (best.matchScore >= 18 && base.cardNo && base.subject) {
+    out.needs_review = false;
+    out.review_reason = null;
+    out.evidence = Array.from(new Set([...(out.evidence || []), `Online exact-match: ${best.title}`])).slice(0, 10);
+  } else {
+    out.needs_review = true;
+    out.review_reason = cleanJoin(out.review_reason, 'Online match found but should be reviewed before professional grading.');
+  }
+  return applyDeterministicIdentity(out, front, back);
+}
+
+function scoreWebResult(r, i, front, back) {
+  const t = `${r.title || ''} ${r.content || ''}`.toLowerCase();
+  let s = 0;
+  const has = v => v && t.includes(String(v).toLowerCase());
+  if (has(i.cardNo)) s += 12;
+  if (has(i.subject)) s += 8;
+  if (has(i.brand)) s += 4;
+  if (has(i.set)) s += 5;
+  const clueText = allReadText(front, back).join(' ');
+  if (/35(?:th)?\s*anniversary/i.test(clueText) && /35(?:th)?\s*anniversary/i.test(t)) s += 3;
+  if (/beckett\.com|tcdb\.com|tradingcarddb\.com|cardboardconnection\.com|topps\.com|psacard\.com/i.test(r.url || '')) s += 3;
+  s += Math.min(2, Math.max(0, Number(r.score) || 0) * 2);
+  return Math.round(s * 10) / 10;
+}
+
+function chooseWebYear(best, answer, current, cardNo, subject) {
+  const title = String(best?.title || '');
+  const text = `${title} ${best?.content || ''} ${answer || ''}`;
+  const titleYears = (title.match(/\b(?:19|20)\d{2}\b/g) || []).map(Number);
+  if (titleYears.length) {
+    if (/35(?:th)?\s*anniversary/i.test(text) && titleYears.length > 1) return Math.max(...titleYears.filter(validYear));
+    const first = validYear(titleYears[0]);
+    if (first) return first;
+  }
+  const all = (text.match(/\b(?:19|20)\d{2}\b/g) || []).map(Number).filter(validYear);
+  if (all.length) {
+    const recent = all.filter(y => y >= 2000);
+    if (recent.length) return Math.max(...recent);
+    return all[0];
+  }
+  return validYear(current);
+}
+
+function chooseWebSet(best, brand, year, subject, cardNo, current) {
+  let title = clean(best?.title);
+  if (!title) return current || null;
+  title = title.replace(/\s*[|–—]\s*(eBay|Beckett|Trading Card Database|TCDB|PSA).*$/i, '');
+  if (subject) title = title.replace(new RegExp(escapeRegex(subject), 'ig'), '');
+  if (cardNo) title = title.replace(new RegExp(`#?${escapeRegex(cardNo)}`, 'ig'), '');
+  if (year) title = title.replace(new RegExp(`\b${year}\b`, 'g'), '');
+  if (brand) title = title.replace(new RegExp(`\b${escapeRegex(brand)}\b`, 'ig'), '');
+  title = title.replace(/\b(card|football card|basketball card|baseball card)\b/ig, ' ')
+    .replace(/^[\s:#|–—-]+|[\s:#|–—-]+$/g, '').replace(/\s+/g, ' ').trim();
+  if (title.length >= 4 && title.length <= 120) return title;
+  return current || null;
+}
+
+function extractCardCodeFromText(text) {
+  const rx = /\b[A-Z0-9]{1,8}-[A-Z0-9]{1,8}\b/gi;
+  const m = String(text || '').match(rx);
+  return m?.[0]?.toUpperCase() || null;
+}
+
+function detectBrandFromText(text) {
+  const t = String(text || '');
+  for (const b of ['Topps','Panini','Bowman','Upper Deck','Fleer','Donruss','Score','Leaf']) {
+    if (new RegExp(`\b${escapeRegex(b)}\b`, 'i').test(t)) return b;
+  }
+  return null;
+}
+
+function extractSubjectFromBest(best, front, back) {
+  const known = [front?.identity?.subject, back?.identity?.subject].map(clean).filter(Boolean);
+  for (const s of known) if ((best.title || '').toLowerCase().includes(s.toLowerCase())) return s;
+  return known[0] || null;
+}
+
+function escapeRegex(s) { return String(s || '').replace(/[.*+?^${}()|[\]\]/g, '\$&'); }
 
 async function ebaySearch(env, query) {
   if (!query) return { configured: true, items: [], query };

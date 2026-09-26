@@ -1,13 +1,21 @@
-# Card Lab Worker v1.2.5
+# Card Lab Worker v1.3.0
 
-Backend-only reliability update.
+Hybrid card identification update.
 
-- Keeps the existing `AI` binding, `ALLOWED_ORIGIN`, and `CARDLAB_API_KEY` secret.
-- Uses two parallel image AI calls (front + back) instead of adding a third serial identity read.
-- Back-side prompt explicitly prioritizes card number, manufacturer, copyright line, and distinguishes stats years from release/copyright years.
-- Preserves deterministic safeguards for known card-code/design clues such as `91TF-` + 35th Anniversary.
+## What changed
+- Uses the existing front/back photo analysis to extract text clues and condition data.
+- Sends only text clues/search terms (not card photos) to Tavily Search.
+- Uses live web results/checklists to verify year, brand, set/insert, subject, and card number.
+- Keeps card condition and pre-grading based on the photos only.
+- Uses one basic Tavily search per card to conserve free credits.
+- Falls back to the existing photo-only logic if Tavily is unavailable.
 
-Upload these files to the existing `card-lab-api` GitHub repository. Cloudflare should redeploy automatically. No iPhone app reinstall is required.
+## Existing settings kept
+- AI binding: `AI`
+- Variable: `ALLOWED_ORIGIN`
+- Secret: `CARDLAB_API_KEY`
 
+## New required secret
+- `TAVILY_API_KEY` (already configured in Cloudflare before deploying this version)
 
-Reliability change: v1.2.5 uses only the two front/back vision calls and deterministic reconciliation; it removes the third AI reconciliation call that could cause intermittent mobile Load failed errors.
+Upload these 3 files to the existing `card-lab-api` GitHub repository. Cloudflare should redeploy automatically. No iPhone frontend reinstall is required; Card Lab v1.4 can stay installed.
