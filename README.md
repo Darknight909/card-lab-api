@@ -1,4 +1,4 @@
-# Card Lab API v1.2.1 — Cloudflare Worker
+# Card Lab API v1.2.2 — Cloudflare Worker
 
 This Worker receives the front/back card photos, uses Cloudflare Workers AI transiently, reconciles the identity and visible condition, and optionally searches current eBay listings if eBay Developer credentials are configured.
 
@@ -23,5 +23,12 @@ Create a Worker named `card-lab-api`, replace the starter code with worker.js, a
 Do not store photos in KV/R2/D1 unless you intentionally add cloud storage later. This Worker itself does not persist photos.
 
 
-## v1.2.1 fix
+## v1.2.2 fix
 Uses a JSON-Mode-supported reconciliation model and accepts Cloudflare structured `response` objects. If reconciliation still fails, it falls back to a conservative merge instead of failing the whole analysis.
+
+
+## v1.2.2
+- Adds a focused back-of-card identity pass for card code, manufacturer logo, and tiny copyright year.
+- Prevents statistics years from becoming release years.
+- Normalizes common OCR brand errors such as TRAPS/T0PPS to Topps.
+- Adds deterministic identity guardrails after AI reconciliation.

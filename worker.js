@@ -1,4 +1,4 @@
-const VERSION = '1.2.1';
+const VERSION = '1.2.2';
 const DEFAULT_ORIGIN = 'https://darknight909.github.io';
 const VISION_MODEL = '@cf/moondream/moondream3.1-9B-A2B';
 const TEXT_MODEL = '@cf/meta/llama-3.3-70b-instruct-fp8-fast';
@@ -46,7 +46,13 @@ export default {
         inspectSide(env, 'back', back),
       ]);
 
-      const provisional = provisionalIdentity(frontRead, backRead);
+      // A separate focused read of the back targets the tiny copyright line,
+      // manufacturer logo and card code. This prevents prominent stats years
+      // from being mistaken for the release year.
+      let identityMarks = null;
+      try { identityMarks = await inspectIdentityMarks(env, back); } catch (e) { console.warn('Identity marks read failed:', e); }
+
+      const provisional = provisionalIdentity(frontRead, backRead, identityMarks);
       let ebay = { configured: false, items: [], query: buildQuery(provisional) };
       if (env.EBAY_CLIENT_ID && env.EBAY_CLIENT_SECRET) {
         try {
@@ -56,7 +62,8 @@ export default {
         }
       }
 
-      const analysis = await reconcile(env, frontRead, backRead, ebay.items || []);
+      const reconciled = await reconcile(env, frontRead, backRead, ebay.items || []);
+      const analysis = guardIdentity(reconciled, frontRead, backRead, identityMarks);
       const query = buildQuery(analysis.identity || provisional);
 
       // If the refined identity materially differs, refresh eBay once.
@@ -154,17 +161,48 @@ Scores are 1-10 in 0.5 increments. photo_confidence is 0-100.`;
   return parseModelJSON(text, `${side} vision`);
 }
 
-function provisionalIdentity(front, back) {
-  const fi = front?.identity || {}, bi = back?.identity || {};
-  const release = bi.release_year || fi.release_year || null;
+async function inspectIdentityMarks(env, image) {
+  const question = `Inspect ONLY identity marks on the BACK of this trading card. Return ONLY valid JSON, no markdown.
+
+Read these areas with extra care: top-left card code, player/team line, manufacturer logo near the bottom, and the tiny copyright/legal line at the very bottom.
+
+CRITICAL YEAR RULES:
+- A heading such as "2025 RECEIVING STATS" is a statistics season, NOT the card release year.
+- A birth year or draft year is NOT the release year.
+- If the tiny legal line says a copyright year such as "© 2026 ... TOPPS COMPANY", return that as copyright_year.
+- Only set release_year when the card itself supports it; otherwise null.
+
+CRITICAL BRAND RULE: logos/text may be stylized. "Topps" must be returned as "Topps" when that logo is visible; do not output OCR-like variants such as TRAPS/T0PPS.
+
+JSON:
+{
+  "subject": string|null,
+  "team": string|null,
+  "card_number": string|null,
+  "manufacturer": string|null,
+  "copyright_year": number|null,
+  "release_year": number|null,
+  "set_or_insert": string|null,
+  "stats_years": [number],
+  "evidence": [string]
+}`;
+  const raw = await env.AI.run(VISION_MODEL, {
+    task: 'query', image, question, reasoning: false, temperature: 0, max_tokens: 900, stream: false,
+  });
+  return parseModelJSON(modelText(raw), 'identity marks');
+}
+
+function provisionalIdentity(front, back, marks = null) {
+  const fi = front?.identity || {}, bi = back?.identity || {}, mi = marks || {};
+  const release = validYear(mi.release_year) || validYear(mi.copyright_year) || validYear(bi.release_year) || validYear(fi.release_year) || null;
   return {
     year: release,
-    brand: bi.brand || fi.brand || null,
-    set: bi.exact_set_or_insert || fi.exact_set_or_insert || null,
-    subject: bi.subject || fi.subject || null,
-    cardNo: bi.card_number || fi.card_number || null,
+    brand: normalizeBrand(mi.manufacturer || bi.brand || fi.brand),
+    set: clean(mi.set_or_insert) || bi.exact_set_or_insert || fi.exact_set_or_insert || null,
+    subject: clean(mi.subject) || bi.subject || fi.subject || null,
+    cardNo: clean(mi.card_number) || bi.card_number || fi.card_number || null,
     variation: bi.variation_or_parallel || fi.variation_or_parallel || null,
-    team: bi.team_or_affiliation || fi.team_or_affiliation || null,
+    team: clean(mi.team) || bi.team_or_affiliation || fi.team_or_affiliation || null,
     category: bi.category || fi.category || null,
   };
 }
@@ -291,6 +329,80 @@ function fallbackReconcile(front, back) {
   }, front, back);
 }
 
+function guardIdentity(analysis, front, back, marks = null) {
+  const out = structuredClone(analysis);
+  const fi = front?.identity || {}, bi = back?.identity || {}, mi = marks || {};
+
+  // Normalize common stylized/OCR manufacturer errors (e.g. TRAPS -> Topps).
+  out.identity.brand = normalizeBrand(mi.manufacturer || out.identity.brand || bi.brand || fi.brand);
+
+  // Prefer the focused legal-line read over prominent statistics years.
+  const strongYear = validYear(mi.release_year) || validYear(mi.copyright_year);
+  if (strongYear) {
+    if (out.identity.year && out.identity.year !== strongYear) {
+      out.needs_review = true;
+      out.review_reason = cleanJoin(out.review_reason, `Year corrected to ${strongYear} from focused copyright/product evidence.`);
+    }
+    out.identity.year = strongYear;
+  } else {
+    const allYears = [...(fi.years_seen || []), ...(bi.years_seen || [])];
+    const y = Number(out.identity.year);
+    if (y) {
+      const rolesForY = allYears.filter(x => Number(x?.year) === y).map(x => String(x?.role || 'unknown'));
+      const onlyNonRelease = rolesForY.length && rolesForY.every(r => ['stats','birth','draft','design','unknown'].includes(r));
+      if (onlyNonRelease && rolesForY.includes('stats')) {
+        out.identity.year = null;
+        out.needs_review = true;
+        out.review_reason = cleanJoin(out.review_reason, `${y} appears only as a statistics year, so it was not used as the product year.`);
+      }
+    }
+  }
+
+  if (mi.card_number) out.identity.cardNo = clean(mi.card_number);
+  if (mi.subject) out.identity.subject = clean(mi.subject);
+  if (mi.team) out.identity.team = clean(mi.team);
+  if (mi.set_or_insert && !out.identity.set) out.identity.set = clean(mi.set_or_insert);
+
+  // Known 1991 Topps Football anniversary code family. The code itself plus
+  // the 35th Anniversary front badge is stronger than a stats-year heading.
+  const clueText = [out.identity.cardNo, out.identity.set, ...(fi.set_clues||[]), ...(bi.set_clues||[]), ...(mi.evidence||[]), ...(front?.visible_text||[]), ...(back?.visible_text||[])].filter(Boolean).join(' ');
+  if (/^91TF-/i.test(out.identity.cardNo || '') && /35(?:th)?\s*anniversary/i.test(clueText)) {
+    out.identity.brand = 'Topps';
+    out.identity.year = 2026;
+    if (!out.identity.set || /traps/i.test(out.identity.set)) out.identity.set = '1991 Topps Football 35th Anniversary';
+  }
+
+  return out;
+}
+
+function normalizeBrand(value) {
+  const raw = clean(value);
+  if (!raw) return null;
+  const brands = ['Topps','Panini','Bowman','Upper Deck','Fleer','Donruss','Score','Leaf'];
+  const n = normalizeToken(raw);
+  for (const b of brands) {
+    const bn = normalizeToken(b);
+    if (n === bn) return b;
+    if (Math.abs(n.length - bn.length) <= 1 && levenshtein(n, bn) <= 2) return b;
+  }
+  return raw;
+}
+function normalizeToken(s) { return String(s).toLowerCase().replace(/[^a-z0-9]/g, '').replace(/0/g,'o').replace(/5/g,'s'); }
+function levenshtein(a,b) {
+  const m=Array.from({length:b.length+1},(_,i)=>i);
+  for (let i=1;i<=a.length;i++) {
+    let prev=m[0]; m[0]=i;
+    for (let j=1;j<=b.length;j++) {
+      const tmp=m[j];
+      m[j]=Math.min(m[j]+1,m[j-1]+1,prev+(a[i-1]===b[j-1]?0:1));
+      prev=tmp;
+    }
+  }
+  return m[b.length];
+}
+function validYear(v) { const n=Number(v); return Number.isInteger(n) && n>=1880 && n<=2100 ? n : null; }
+function cleanJoin(a,b) { return [clean(a),clean(b)].filter(Boolean).join(' '); }
+
 function normalizeAnalysis(a, front, back) {
   const identity = a.identity || {};
   const c = a.condition || {};
@@ -299,7 +411,7 @@ function normalizeAnalysis(a, front, back) {
   return {
     identity: {
       year: identity.year ? Number(identity.year) : null,
-      brand: clean(identity.brand), set: clean(identity.set), subject: clean(identity.subject),
+      brand: normalizeBrand(identity.brand), set: clean(identity.set), subject: clean(identity.subject),
       cardNo: clean(identity.cardNo), variation: clean(identity.variation), team: clean(identity.team),
       category: ['Sports','TCG','Non-sport','Other'].includes(identity.category) ? identity.category : 'Other',
     },
