@@ -1,4 +1,4 @@
-const VERSION = '1.2.2';
+const VERSION = '1.2.3';
 const DEFAULT_ORIGIN = 'https://darknight909.github.io';
 const VISION_MODEL = '@cf/moondream/moondream3.1-9B-A2B';
 const TEXT_MODEL = '@cf/meta/llama-3.3-70b-instruct-fp8-fast';
@@ -46,13 +46,10 @@ export default {
         inspectSide(env, 'back', back),
       ]);
 
-      // A separate focused read of the back targets the tiny copyright line,
-      // manufacturer logo and card code. This prevents prominent stats years
-      // from being mistaken for the release year.
-      let identityMarks = null;
-      try { identityMarks = await inspectIdentityMarks(env, back); } catch (e) { console.warn('Identity marks read failed:', e); }
-
-      const provisional = provisionalIdentity(frontRead, backRead, identityMarks);
+      // Keep analysis to two image-model calls (front + back) for better
+      // reliability on mobile. Back-side identity marks are requested directly
+      // in the normal back read instead of using a third serial AI call.
+      const provisional = provisionalIdentity(frontRead, backRead, null);
       let ebay = { configured: false, items: [], query: buildQuery(provisional) };
       if (env.EBAY_CLIENT_ID && env.EBAY_CLIENT_SECRET) {
         try {
@@ -63,7 +60,7 @@ export default {
       }
 
       const reconciled = await reconcile(env, frontRead, backRead, ebay.items || []);
-      const analysis = guardIdentity(reconciled, frontRead, backRead, identityMarks);
+      const analysis = guardIdentity(reconciled, frontRead, backRead, null);
       const query = buildQuery(analysis.identity || provisional);
 
       // If the refined identity materially differs, refresh eBay once.
@@ -120,6 +117,7 @@ Do not invent text. Read visible text carefully. The card can be sports, TCG, or
 IMPORTANT YEAR RULE: distinguish the product/release year from statistics years, season years, copyright years, birth years, draft years, anniversary references, and historical design years. A statistics heading such as "2025 RECEIVING STATS" is NOT automatically the card's release year. If a copyright/product year is explicit, label its role. If release year cannot be established from this side alone, use null.
 IMPORTANT CARD NUMBER RULE: card/set codes such as 91TF-2, US175, RA-TH, #123 are high-value identity clues. Copy exactly when legible.
 For set/insert/parallel, only state an exact value if it is visible or strongly supported by the design/card code; otherwise use null and put clues in set_clues.
+${side === 'back' ? `BACK-SIDE IDENTITY PRIORITY: read the top/upper card code, player/team line, manufacturer logo near the bottom, and the tiny copyright/legal line at the bottom. If the legal line gives a copyright year, record it in years_seen with role "copyright". A heading such as "2025 RECEIVING STATS" must be role "stats", never release. Stylized Topps logos must be returned as brand "Topps", not OCR-like variants.` : ''}
 
 For condition, estimate only defects visible in THIS photo. Be conservative. A missing defect means "not visible", not proof it is absent. Surface defects are hard to assess under glare.
 Centering should be a best visual estimate as percentages with the larger side first, for left/right and top/bottom, or null for borderless/uncertain designs.
@@ -159,37 +157,6 @@ Scores are 1-10 in 0.5 increments. photo_confidence is 0-100.`;
   });
   const text = modelText(raw);
   return parseModelJSON(text, `${side} vision`);
-}
-
-async function inspectIdentityMarks(env, image) {
-  const question = `Inspect ONLY identity marks on the BACK of this trading card. Return ONLY valid JSON, no markdown.
-
-Read these areas with extra care: top-left card code, player/team line, manufacturer logo near the bottom, and the tiny copyright/legal line at the very bottom.
-
-CRITICAL YEAR RULES:
-- A heading such as "2025 RECEIVING STATS" is a statistics season, NOT the card release year.
-- A birth year or draft year is NOT the release year.
-- If the tiny legal line says a copyright year such as "© 2026 ... TOPPS COMPANY", return that as copyright_year.
-- Only set release_year when the card itself supports it; otherwise null.
-
-CRITICAL BRAND RULE: logos/text may be stylized. "Topps" must be returned as "Topps" when that logo is visible; do not output OCR-like variants such as TRAPS/T0PPS.
-
-JSON:
-{
-  "subject": string|null,
-  "team": string|null,
-  "card_number": string|null,
-  "manufacturer": string|null,
-  "copyright_year": number|null,
-  "release_year": number|null,
-  "set_or_insert": string|null,
-  "stats_years": [number],
-  "evidence": [string]
-}`;
-  const raw = await env.AI.run(VISION_MODEL, {
-    task: 'query', image, question, reasoning: false, temperature: 0, max_tokens: 900, stream: false,
-  });
-  return parseModelJSON(modelText(raw), 'identity marks');
 }
 
 function provisionalIdentity(front, back, marks = null) {
@@ -294,7 +261,7 @@ function fallbackReconcile(front, back) {
   // If the card itself says it is a 35th-anniversary treatment of a 1991 design,
   // 1991 + 35 = 2026 is a strong product-year clue. This also prevents a 2025
   // statistics heading from being mistaken for the release year.
-  const clues = [fi.exact_set_or_insert, bi.exact_set_or_insert, ...(fi.set_clues||[]), ...(bi.set_clues||[]), ...(fi.visible_text||[]), ...(bi.visible_text||[])].join(' ');
+  const clues = [fi.exact_set_or_insert, bi.exact_set_or_insert, ...(fi.set_clues||[]), ...(bi.set_clues||[]), ...(front?.visible_text||[]), ...(back?.visible_text||[])].join(' ');
   if (/35(?:th)?\s+anniversary/i.test(clues) && /1991/i.test(clues)) year = 2026;
   if (!year) {
     const release = years.find(x => x?.role === 'release');
@@ -337,7 +304,9 @@ function guardIdentity(analysis, front, back, marks = null) {
   out.identity.brand = normalizeBrand(mi.manufacturer || out.identity.brand || bi.brand || fi.brand);
 
   // Prefer the focused legal-line read over prominent statistics years.
-  const strongYear = validYear(mi.release_year) || validYear(mi.copyright_year);
+  const yearEvidence = [...(fi.years_seen || []), ...(bi.years_seen || [])];
+  const releaseEvidence = yearEvidence.find(x => ['release','copyright'].includes(String(x?.role || '')) && validYear(x?.year));
+  const strongYear = validYear(mi.release_year) || validYear(mi.copyright_year) || validYear(releaseEvidence?.year);
   if (strongYear) {
     if (out.identity.year && out.identity.year !== strongYear) {
       out.needs_review = true;
