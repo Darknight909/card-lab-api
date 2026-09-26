@@ -1,4 +1,4 @@
-# Card Lab Worker v1.2.3
+# Card Lab Worker v1.2.4
 
 Backend-only reliability update.
 

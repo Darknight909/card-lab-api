@@ -1,4 +1,4 @@
-const VERSION = '1.2.3';
+const VERSION = '1.2.4';
 const DEFAULT_ORIGIN = 'https://darknight909.github.io';
 const VISION_MODEL = '@cf/moondream/moondream3.1-9B-A2B';
 const TEXT_MODEL = '@cf/meta/llama-3.3-70b-instruct-fp8-fast';
@@ -115,7 +115,7 @@ async function inspectSide(env, side, image) {
 
 Do not invent text. Read visible text carefully. The card can be sports, TCG, or non-sport.
 IMPORTANT YEAR RULE: distinguish the product/release year from statistics years, season years, copyright years, birth years, draft years, anniversary references, and historical design years. A statistics heading such as "2025 RECEIVING STATS" is NOT automatically the card's release year. If a copyright/product year is explicit, label its role. If release year cannot be established from this side alone, use null.
-IMPORTANT CARD NUMBER RULE: card/set codes such as 91TF-2, US175, RA-TH, #123 are high-value identity clues. Copy exactly when legible.
+IMPORTANT CARD NUMBER RULE: card/set codes such as 91TF-2, US175, RA-TH, #123 are high-value identity clues. Copy exactly when legible. Do NOT treat a large uniform/jersey number, stat total, serial on equipment, or player number as the card number unless the card explicitly labels it as the card number.
 For set/insert/parallel, only state an exact value if it is visible or strongly supported by the design/card code; otherwise use null and put clues in set_clues.
 ${side === 'back' ? `BACK-SIDE IDENTITY PRIORITY: read the top/upper card code, player/team line, manufacturer logo near the bottom, and the tiny copyright/legal line at the bottom. If the legal line gives a copyright year, record it in years_seen with role "copyright". A heading such as "2025 RECEIVING STATS" must be role "stats", never release. Stylized Topps logos must be returned as brand "Topps", not OCR-like variants.` : ''}
 
@@ -161,13 +161,14 @@ Scores are 1-10 in 0.5 increments. photo_confidence is 0-100.`;
 
 function provisionalIdentity(front, back, marks = null) {
   const fi = front?.identity || {}, bi = back?.identity || {}, mi = marks || {};
-  const release = validYear(mi.release_year) || validYear(mi.copyright_year) || validYear(bi.release_year) || validYear(fi.release_year) || null;
+  const release = validYear(mi.release_year) || validYear(bi.release_year) || validYear(fi.release_year) || null;
+  const cardCode = extractBestCardCode(front, back) || clean(mi.card_number) || clean(bi.card_number) || clean(fi.card_number) || null;
   return {
     year: release,
-    brand: normalizeBrand(mi.manufacturer || bi.brand || fi.brand),
+    brand: normalizeBrand(mi.manufacturer || bi.brand || fi.brand || detectBrandFromReads(front, back)),
     set: clean(mi.set_or_insert) || bi.exact_set_or_insert || fi.exact_set_or_insert || null,
     subject: clean(mi.subject) || bi.subject || fi.subject || null,
-    cardNo: clean(mi.card_number) || bi.card_number || fi.card_number || null,
+    cardNo: cardCode,
     variation: bi.variation_or_parallel || fi.variation_or_parallel || null,
     team: clean(mi.team) || bi.team_or_affiliation || fi.team_or_affiliation || null,
     category: bi.category || fi.category || null,
@@ -244,6 +245,85 @@ function structuredModelResult(raw, label) {
   return parseModelJSON(modelText(raw), label);
 }
 
+
+function allReadText(front, back) {
+  const vals = [];
+  for (const r of [front, back]) {
+    if (!r) continue;
+    const i = r.identity || {};
+    vals.push(i.card_number, i.subject, i.brand, i.exact_set_or_insert, i.team_or_affiliation);
+    if (Array.isArray(i.set_clues)) vals.push(...i.set_clues);
+    if (Array.isArray(r.visible_text)) vals.push(...r.visible_text);
+  }
+  return vals.filter(Boolean).map(String);
+}
+
+function extractBestCardCode(front, back) {
+  const texts = allReadText(front, back);
+  const candidates = [];
+  const add = (raw, score) => {
+    const v = clean(raw);
+    if (!v) return;
+    const u = v.replace(/^#/, '').toUpperCase();
+    if (!/[A-Z]/.test(u) && /^\d{1,3}$/.test(u)) return;
+    if (u.length < 2 || u.length > 20) return;
+    candidates.push({v:u, score});
+  };
+  for (const r of [back, front]) {
+    const c = r?.identity?.card_number;
+    if (c) add(c, /[A-Z].*\d|\d.*[A-Z]/i.test(c) ? 100 : 35);
+  }
+  const rx = /\b[A-Z0-9]{1,8}-[A-Z0-9]{1,8}\b/gi;
+  const rx2 = /\b(?=[A-Z0-9]{3,12}\b)(?=[A-Z0-9]*[A-Z])(?=[A-Z0-9]*\d)[A-Z0-9]{3,12}\b/gi;
+  for (const t of texts) {
+    for (const m of String(t).match(rx) || []) add(m, 120);
+    for (const m of String(t).match(rx2) || []) add(m, 70);
+  }
+  candidates.sort((a,b)=>b.score-a.score || b.v.length-a.v.length);
+  return candidates[0]?.v || null;
+}
+
+function detectBrandFromReads(front, back) {
+  const t = allReadText(front, back).join(' ');
+  if (/\btopps\b/i.test(t)) return 'Topps';
+  if (/\bpanini\b/i.test(t)) return 'Panini';
+  if (/\bbowman\b/i.test(t)) return 'Bowman';
+  if (/\bupper\s+deck\b/i.test(t)) return 'Upper Deck';
+  if (/\bfleer\b/i.test(t)) return 'Fleer';
+  if (/\bdonruss\b/i.test(t)) return 'Donruss';
+  return null;
+}
+
+function applyDeterministicIdentity(out, front, back) {
+  const code = extractBestCardCode(front, back);
+  if (code) out.identity.cardNo = code;
+
+  const text = allReadText(front, back).join(' ');
+  const detectedBrand = detectBrandFromReads(front, back);
+  if (detectedBrand) out.identity.brand = detectedBrand;
+
+  if (/^91TF-\w+/i.test(code || '') && /35(?:th)?\s*anniversary/i.test(text)) {
+    out.identity.brand = 'Topps';
+    out.identity.year = 2026;
+    out.identity.set = '1991 Topps Football 35th Anniversary';
+    out.needs_review = false;
+    out.review_reason = null;
+    out.evidence = Array.from(new Set([...(out.evidence||[]), `Card code ${code}`, '35th Anniversary design cue']));
+  }
+
+  const years = [...(front?.identity?.years_seen || []), ...(back?.identity?.years_seen || [])];
+  const y = Number(out.identity.year);
+  if (y && !/^91TF-/i.test(code || '')) {
+    const roles = years.filter(x => Number(x?.year) === y).map(x => String(x?.role || 'unknown'));
+    if (roles.length && roles.every(r => ['stats','birth','draft','design','unknown','copyright'].includes(r)) && roles.includes('stats')) {
+      out.identity.year = null;
+      out.needs_review = true;
+      out.review_reason = cleanJoin(out.review_reason, `${y} is supported only by non-release evidence.`);
+    }
+  }
+  return out;
+}
+
 function fallbackReconcile(front, back) {
   const fi = front?.identity || {}, bi = back?.identity || {};
   const fc = front?.condition || {}, bc = back?.condition || {};
@@ -270,10 +350,10 @@ function fallbackReconcile(front, back) {
   return normalizeAnalysis({
     identity: {
       year,
-      brand: choose(bi.brand, fi.brand),
+      brand: normalizeBrand(detectBrandFromReads(front, back) || choose(bi.brand, fi.brand)),
       set: choose(bi.exact_set_or_insert, fi.exact_set_or_insert),
       subject: choose(bi.subject, fi.subject),
-      cardNo: choose(bi.card_number, fi.card_number),
+      cardNo: extractBestCardCode(front, back) || choose(bi.card_number, fi.card_number),
       variation: choose(bi.variation_or_parallel, fi.variation_or_parallel),
       team: choose(bi.team_or_affiliation, fi.team_or_affiliation),
       category: bi.category || fi.category || 'Other',
@@ -305,8 +385,8 @@ function guardIdentity(analysis, front, back, marks = null) {
 
   // Prefer the focused legal-line read over prominent statistics years.
   const yearEvidence = [...(fi.years_seen || []), ...(bi.years_seen || [])];
-  const releaseEvidence = yearEvidence.find(x => ['release','copyright'].includes(String(x?.role || '')) && validYear(x?.year));
-  const strongYear = validYear(mi.release_year) || validYear(mi.copyright_year) || validYear(releaseEvidence?.year);
+  const releaseEvidence = yearEvidence.find(x => String(x?.role || '') === 'release' && validYear(x?.year));
+  const strongYear = validYear(mi.release_year) || validYear(releaseEvidence?.year);
   if (strongYear) {
     if (out.identity.year && out.identity.year !== strongYear) {
       out.needs_review = true;
@@ -341,7 +421,7 @@ function guardIdentity(analysis, front, back, marks = null) {
     if (!out.identity.set || /traps/i.test(out.identity.set)) out.identity.set = '1991 Topps Football 35th Anniversary';
   }
 
-  return out;
+  return applyDeterministicIdentity(out, front, back);
 }
 
 function normalizeBrand(value) {
