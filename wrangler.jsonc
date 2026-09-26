@@ -1,0 +1,9 @@
+{
+  "name": "card-lab-api",
+  "main": "worker.js",
+  "compatibility_date": "2026-09-25",
+  "ai": { "binding": "AI" },
+  "vars": {
+    "ALLOWED_ORIGIN": "https://darknight909.github.io"
+  }
+}
