@@ -1,7 +1,7 @@
-const VERSION = '1.4.0';
+const VERSION = '1.4.1';
 const DEFAULT_ORIGIN = 'https://darknight909.github.io';
-const VISION_MODEL = '@cf/moondream/moondream3.1-9B-A2B';
-const TEXT_MODEL = '@cf/meta/llama-3.3-70b-instruct-fp8-fast';
+const VISION_MODEL = '@cf/google/gemma-4-26b-a4b-it';
+const TEXT_MODEL = '@cf/google/gemma-4-26b-a4b-it';
 
 let ebayTokenCache = { token: null, expiresAt: 0 };
 
@@ -185,7 +185,15 @@ JSON schema:
 Scores are 1-10 in 0.5 increments. photo_confidence is 0-100.`;
 
   const raw = await env.AI.run(VISION_MODEL, {
-    task: 'query', image, question, reasoning: false, temperature: 0.05, max_tokens: 2500, stream: false,
+    messages: [
+      { role: 'system', content: 'You are a precise trading-card OCR and condition-inspection engine. Return one valid JSON object only. Never invent text.' },
+      { role: 'user', content: question },
+    ],
+    image,
+    chat_template_kwargs: { enable_thinking: false },
+    temperature: 0.02,
+    max_tokens: 2200,
+    stream: false,
   });
   const text = modelText(raw);
   return parseModelJSON(text, `${side} vision`);
@@ -360,9 +368,9 @@ function fallbackReconcile(front, back) {
   const fi = front?.identity || {}, bi = back?.identity || {};
   const fc = front?.condition || {}, bc = back?.condition || {};
   const choose = (a, b) => clean(a) || clean(b) || null;
-  const worse = (a, b, d = 5) => {
+  const worse = (a, b) => {
     const vals = [Number(a), Number(b)].filter(Number.isFinite);
-    return clampHalf(vals.length ? Math.min(...vals) : d, 1, 10);
+    return vals.length ? clampHalf(Math.min(...vals), 1, 10) : null;
   };
   const defects = {};
   for (const k of ['crease','dent','stain','scratch','printline','mark','possible_alteration']) {
@@ -398,13 +406,13 @@ function fallbackReconcile(front, back) {
       front: { lr: fc.centering_lr || null, tb: fc.centering_tb || null },
       back: { lr: bc.centering_lr || null, tb: bc.centering_tb || null },
       defects,
-      notes: ['Automatic reconciliation used the conservative fallback because the structured AI response could not be read.'],
+      notes: ['Front and back visual reads were combined conservatively. Photo-only grading cannot confirm hidden or microscopic defects.'],
     },
-    identity_confidence: 55,
-    condition_confidence: 45,
+    identity_confidence: (extractBestCardCode(front, back) && choose(bi.subject, fi.subject)) ? 78 : 55,
+    condition_confidence: Math.round(([fc.photo_confidence, bc.photo_confidence].map(Number).filter(Number.isFinite).reduce((a,b)=>a+b,0) / Math.max(1,[fc.photo_confidence, bc.photo_confidence].map(Number).filter(Number.isFinite).length)) || 0),
     evidence: ['Front/back vision reads were merged conservatively.'],
-    needs_review: true,
-    review_reason: 'Structured reconciliation fallback used; verify identity before professional grading.',
+    needs_review: !(extractBestCardCode(front, back) && choose(bi.subject, fi.subject)),
+    review_reason: (extractBestCardCode(front, back) && choose(bi.subject, fi.subject)) ? null : 'Automatic identity needs stronger corroboration.', 
   }, front, back);
 }
 
@@ -487,7 +495,7 @@ function cleanJoin(a,b) { return [clean(a),clean(b)].filter(Boolean).join(' '); 
 function normalizeAnalysis(a, front, back) {
   const identity = a.identity || {};
   const c = a.condition || {};
-  const clampScore = v => clampHalf(Number(v) || 1, 1, 10);
+  const clampScore = v => { const n = Number(v); return Number.isFinite(n) ? clampHalf(n, 1, 10) : null; };
   const pair = p => Array.isArray(p) && p.length === 2 && p.every(Number.isFinite) ? normalizePair(p) : null;
   return {
     identity: {
@@ -545,7 +553,7 @@ function buildQuery(i = {}) {
 async function tavilyCardLookup(env, provisional, front, back) {
   const queries = buildLookupQueries(provisional, front, back);
   if (!queries.length) return { configured: true, used: false, query: '', queries: [], results: [], answer: null };
-  const batches = await Promise.all(queries.slice(0, 2).map(q => tavilySearch(env, q, 8)));
+  const batches = await Promise.all(queries.slice(0, 3).map(q => tavilySearch(env, q, 8)));
   const byUrl = new Map();
   for (const b of batches) for (const x of b.results || []) {
     const key = x.url || `${x.title}|${x.content}`;
@@ -581,7 +589,7 @@ function buildLookupQueries(i = {}, front, back) {
   const brand = normalizeBrand(i.brand || detectBrandFromReads(front, back)) || '';
   const setClues = [...(front?.identity?.set_clues || []), ...(back?.identity?.set_clues || [])].filter(Boolean).slice(0,3).join(' ');
   const q=[];
-  if (code) q.push([`"${code}"`, subject && `"${subject}"`, brand, 'trading card checklist set year'].filter(Boolean).join(' '));
+  if (code) { q.push([`"${code}"`, subject && `"${subject}"`, brand, 'trading card checklist set year'].filter(Boolean).join(' ')); q.push([`"${code}"`, subject && `"${subject}"`, 'TCDB Beckett Topps'].filter(Boolean).join(' ')); }
   if (subject) q.push([`"${subject}"`, code && `"${code}"`, brand, i.set || setClues, 'trading card'].filter(Boolean).join(' '));
   if (!q.length && rawText) q.push(`${rawText.slice(0,220)} trading card identify set card number`);
   return [...new Set(q.map(x=>x.replace(/\s+/g,' ').trim()).filter(Boolean))];
@@ -640,8 +648,11 @@ async function resolveIdentityFromWeb(env, analysis, web, front, back) {
     searchResults: web.results.slice(0, 10).map(x => ({title:x.title,url:x.url,content:x.content})),
   };
   const prompt = `Identify ONE collectible trading card from visual text clues plus live web search results. Return ONLY valid JSON. Do not use a statistics season as the product release year. Treat an alphanumeric card code (example 91TF-2) as stronger evidence than a jersey number. Prefer exact checklist/manufacturer/database matches across multiple sources. If a field is not supportable, use null.\n\nINPUT:\n${JSON.stringify(clues)}\n\nRETURN:\n{"year":number|null,"brand":string|null,"set":string|null,"subject":string|null,"cardNo":string|null,"variation":string|null,"team":string|null,"category":"Sports|TCG|Non-sport|Other|null","confidence":number,"evidence":["..."]}`;
-  const raw = await env.AI.run(TEXT_MODEL, {messages:[{role:'system',content:'You identify trading cards from corroborated web evidence. Return JSON only.'},{role:'user',content:prompt}],temperature:0.02,max_tokens:900,stream:false});
-  const obj = parseModelJSON(modelText(raw), 'web identity');
+  const raw = await env.AI.run(TEXT_MODEL, {
+    messages:[{role:'system',content:'You identify trading cards from corroborated web evidence. Return one JSON object only.'},{role:'user',content:prompt}],
+    chat_template_kwargs:{enable_thinking:false},temperature:0.02,max_tokens:900,stream:false
+  });
+  const obj = structuredModelResult(raw, 'web identity');
   const out = structuredClone(analysis);
   out.identity ||= {};
   for (const k of ['year','brand','set','subject','cardNo','variation','team','category']) if (obj[k] !== null && obj[k] !== undefined && obj[k] !== '') out.identity[k] = k==='brand' ? normalizeBrand(obj[k]) : obj[k];
@@ -666,9 +677,12 @@ function scoreWebResult(r, i, front, back) {
   const t = `${r.title || ''} ${r.content || ''}`.toLowerCase();
   let s = 0;
   const has = v => v && t.includes(String(v).toLowerCase());
-  if (has(i.cardNo)) s += 12;
-  if (has(i.subject)) s += 8;
-  if (has(i.brand)) s += 4;
+  const readCode = extractBestCardCode(front, back);
+  const readSubject = front?.identity?.subject || back?.identity?.subject;
+  const readBrand = detectBrandFromReads(front, back);
+  if (has(i.cardNo || readCode)) s += 12;
+  if (has(i.subject || readSubject)) s += 8;
+  if (has(i.brand || readBrand)) s += 4;
   if (has(i.set)) s += 5;
   const clueText = allReadText(front, back).join(' ');
   if (/35(?:th)?\s*anniversary/i.test(clueText) && /35(?:th)?\s*anniversary/i.test(t)) s += 3;
@@ -701,8 +715,8 @@ function chooseWebSet(best, brand, year, subject, cardNo, current) {
   title = title.replace(/\s*[|–—]\s*(eBay|Beckett|Trading Card Database|TCDB|PSA).*$/i, '');
   if (subject) title = title.replace(new RegExp(escapeRegex(subject), 'ig'), '');
   if (cardNo) title = title.replace(new RegExp(`#?${escapeRegex(cardNo)}`, 'ig'), '');
-  if (year) title = title.replace(new RegExp(`\b${year}\b`, 'g'), '');
-  if (brand) title = title.replace(new RegExp(`\b${escapeRegex(brand)}\b`, 'ig'), '');
+  if (year) title = title.replace(new RegExp(`\\b${year}\\b`, 'g'), '');
+  if (brand) title = title.replace(new RegExp(`\\b${escapeRegex(brand)}\\b`, 'ig'), '');
   title = title.replace(/\b(card|football card|basketball card|baseball card)\b/ig, ' ')
     .replace(/^[\s:#|–—-]+|[\s:#|–—-]+$/g, '').replace(/\s+/g, ' ').trim();
   if (title.length >= 4 && title.length <= 120) return title;
