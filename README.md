@@ -1,4 +1,4 @@
-# Card Lab Worker v1.2.4
+# Card Lab Worker v1.2.5
 
 Backend-only reliability update.
 
@@ -8,3 +8,6 @@ Backend-only reliability update.
 - Preserves deterministic safeguards for known card-code/design clues such as `91TF-` + 35th Anniversary.
 
 Upload these files to the existing `card-lab-api` GitHub repository. Cloudflare should redeploy automatically. No iPhone app reinstall is required.
+
+
+Reliability change: v1.2.5 uses only the two front/back vision calls and deterministic reconciliation; it removes the third AI reconciliation call that could cause intermittent mobile Load failed errors.

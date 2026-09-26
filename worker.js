@@ -1,4 +1,4 @@
-const VERSION = '1.2.4';
+const VERSION = '1.2.5';
 const DEFAULT_ORIGIN = 'https://darknight909.github.io';
 const VISION_MODEL = '@cf/moondream/moondream3.1-9B-A2B';
 const TEXT_MODEL = '@cf/meta/llama-3.3-70b-instruct-fp8-fast';
@@ -59,8 +59,18 @@ export default {
         }
       }
 
-      const reconciled = await reconcile(env, frontRead, backRead, ebay.items || []);
-      const analysis = guardIdentity(reconciled, frontRead, backRead, null);
+      // Reliability-first path: avoid a third AI reconciliation call. The two
+      // image reads are merged deterministically, then guarded by card-code,
+      // brand and year rules. This materially reduces long-request failures
+      // seen in iOS web apps while keeping identity evidence visible.
+      const merged = fallbackReconcile(frontRead, backRead);
+      const analysis = guardIdentity(merged, frontRead, backRead, null);
+      analysis.identity_confidence = Math.max(analysis.identity_confidence || 0,
+        analysis.identity?.cardNo && analysis.identity?.subject ? 78 : 60);
+      analysis.condition_confidence = Math.max(analysis.condition_confidence || 0, 60);
+      if (analysis.identity?.cardNo && analysis.identity?.subject && analysis.identity?.brand) {
+        analysis.evidence = Array.from(new Set([...(analysis.evidence || []), 'Front/back reads merged without a third AI call for mobile reliability.']));
+      }
       const query = buildQuery(analysis.identity || provisional);
 
       // If the refined identity materially differs, refresh eBay once.
