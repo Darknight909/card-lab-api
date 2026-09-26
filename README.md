@@ -1,20 +1,35 @@
-Card Lab Cloudflare Worker v1.4.3
+# Card Lab Cloudflare Worker v2.0.0
 
-Fixes the repeated "front vision returned an unreadable response" failure.
+## Architecture
+- Google Cloud Vision Web Detection is the primary visual identity source.
+- Google Cloud Vision Text Detection reads front/back text and exact card-code clues.
+- If the front produces weak visual-web evidence, the Worker performs one fallback Web Detection pass on the back.
+- Tavily independently verifies identity clues/checklist evidence using text searches only.
+- Cloudflare Workers AI Moondream 3.1 inspects visible physical condition; it is no longer responsible for card identity or centering.
+- A Cloudflare text model reconciles identity evidence conservatively.
+- eBay Browse API is optional if `EBAY_CLIENT_ID` + `EBAY_CLIENT_SECRET` are later configured; otherwise Tavily-backed current eBay web results are used.
+- The Worker does not persist images or collection records.
 
-Changes:
-- Gemma 4 vision output no longer has to be valid JSON.
-- Vision uses a simple KEY=VALUE format with a deterministic parser.
-- If structured vision output is weak, a plain-text OCR fallback still feeds card clues to Tavily.
-- Web identity reconciliation uses a Workers AI model that supports JSON mode.
-- Condition/grade fields remain unavailable instead of being invented when the vision pass cannot support them.
+## Required configuration
+Bindings / variables:
+- Workers AI binding: `AI`
+- `ALLOWED_ORIGIN=https://darknight909.github.io`
 
-Files:
-- worker.js
-- wrangler.jsonc
-- README.md
+Secrets:
+- `CARDLAB_API_KEY`
+- `GOOGLE_VISION_API_KEY`
+- `TAVILY_API_KEY` (recommended for independent verification/current-listing fallback)
 
+Optional secrets:
+- `EBAY_CLIENT_ID`
+- `EBAY_CLIENT_SECRET`
 
-### v1.4.3
-- Switched image OCR/inspection to Cloudflare Moondream 3.1, an image-to-text model optimized for OCR and structured visual queries.
-- Added condition sanity checks so malformed all-1 scores do not produce fake low grades.
+## Files
+- `worker.js`
+- `wrangler.jsonc`
+- `README.md`
+
+## Deploy
+Replace these three files in the existing `card-lab-api` GitHub repository and commit. The existing Cloudflare Git deployment should deploy automatically.
+
+After deployment, Card Lab → Settings → Test connection should report API v2.0.0 and Google Vision ready.

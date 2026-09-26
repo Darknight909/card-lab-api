@@ -1,7 +1,8 @@
-const VERSION = '1.4.3';
+const VERSION = '2.0.0';
 const DEFAULT_ORIGIN = 'https://darknight909.github.io';
-const VISION_MODEL = '@cf/moondream/moondream3.1-9B-A2B';
+const CONDITION_MODEL = '@cf/moondream/moondream3.1-9B-A2B';
 const TEXT_MODEL = '@cf/meta/llama-3.3-70b-instruct-fp8-fast';
+const GOOGLE_VISION_URL = 'https://vision.googleapis.com/v1/images:annotate';
 
 let ebayTokenCache = { token: null, expiresAt: 0 };
 
@@ -11,105 +12,118 @@ export default {
     const allowedOrigin = env.ALLOWED_ORIGIN || DEFAULT_ORIGIN;
     const cors = corsHeaders(origin, allowedOrigin);
 
-    if (request.method === 'OPTIONS') {
-      return new Response(null, { status: 204, headers: cors });
-    }
+    if (request.method === 'OPTIONS') return new Response(null, { status: 204, headers: cors });
 
     const url = new URL(request.url);
     if (url.pathname === '/health' && request.method === 'GET') {
-      return json({ ok: true, service: 'Card Lab API', version: VERSION, ebayConfigured: Boolean(env.EBAY_CLIENT_ID && env.EBAY_CLIENT_SECRET), tavilyConfigured: Boolean(env.TAVILY_API_KEY) }, 200, cors);
+      return json({
+        ok: true,
+        service: 'Card Lab API',
+        version: VERSION,
+        googleVisionConfigured: Boolean(env.GOOGLE_VISION_API_KEY),
+        tavilyConfigured: Boolean(env.TAVILY_API_KEY),
+        ebayConfigured: Boolean(env.EBAY_CLIENT_ID && env.EBAY_CLIENT_SECRET),
+        workersAIConfigured: Boolean(env.AI),
+      }, 200, cors);
     }
 
-    if (origin && origin !== allowedOrigin) {
-      return json({ ok: false, error: 'Origin not allowed' }, 403, cors);
-    }
-
-    if (!env.CARDLAB_API_KEY) {
-      return json({ ok: false, error: 'CARDLAB_API_KEY secret is not configured on the Worker.' }, 500, cors);
-    }
-    const auth = request.headers.get('Authorization') || '';
-    if (auth !== `Bearer ${env.CARDLAB_API_KEY}`) {
-      return json({ ok: false, error: 'Unauthorized' }, 401, cors);
-    }
-
-    if (url.pathname !== '/analyze' || request.method !== 'POST') {
-      return json({ ok: false, error: 'Not found' }, 404, cors);
-    }
+    if (origin && origin !== allowedOrigin) return json({ ok: false, error: 'Origin not allowed' }, 403, cors);
+    if (!env.CARDLAB_API_KEY) return json({ ok: false, error: 'CARDLAB_API_KEY secret is not configured on the Worker.' }, 500, cors);
+    if ((request.headers.get('Authorization') || '') !== `Bearer ${env.CARDLAB_API_KEY}`) return json({ ok: false, error: 'Unauthorized' }, 401, cors);
+    if (url.pathname !== '/analyze' || request.method !== 'POST') return json({ ok: false, error: 'Not found' }, 404, cors);
 
     try {
+      if (!env.GOOGLE_VISION_API_KEY) throw new Error('GOOGLE_VISION_API_KEY secret is not configured on the Worker.');
+
       const body = await request.json();
       const front = validateImage(body.front, 'front');
       const back = validateImage(body.back, 'back');
 
-      const [frontRead, backRead] = await Promise.all([
-        inspectSide(env, 'front', front),
-        inspectSide(env, 'back', back),
+      // Run the independent photo-analysis paths concurrently. Google Vision is
+      // authoritative for OCR + visual-web matching; Workers AI is used only for
+      // visible physical-condition assistance.
+      const [googleInitial, frontCondition, backCondition] = await Promise.all([
+        googleVisionInitial(env, front, back),
+        inspectConditionSide(env, 'front', front),
+        inspectConditionSide(env, 'back', back),
       ]);
 
-      // Step 1: extract clues from the two photos.
-      const provisional = provisionalIdentity(frontRead, backRead, null);
+      // If the front image produced little/no visual-web evidence, try Web Detection
+      // once on the back. This preserves accuracy without paying for two Web Detection
+      // units on every card.
+      let backWebFallback = null;
+      if (googleWebStrength(googleInitial.front) < 2) {
+        try { backWebFallback = await googleVisionWebOnly(env, back); }
+        catch (e) { console.warn('Google back Web Detection fallback:', e); }
+      }
 
-      // Step 2: verify those clues against the live web. Only text clues are
-      // sent to Tavily; the card photos themselves are NOT sent to Tavily.
-      let webLookup = { configured: Boolean(env.TAVILY_API_KEY), used: false, query: '', results: [], answer: null };
+      const google = combineGoogleEvidence(googleInitial, backWebFallback);
+      const provisional = provisionalFromGoogle(google);
+
+      let webLookup = { configured: Boolean(env.TAVILY_API_KEY), used: false, query: '', queries: [], results: [], answer: null };
       if (env.TAVILY_API_KEY) {
-        try {
-          webLookup = await tavilyCardLookup(env, provisional, frontRead, backRead);
-        } catch (e) {
-          webLookup = { configured: true, used: true, query: buildLookupQuery(provisional, frontRead, backRead), results: [], answer: null, error: String(e?.message || e) };
+        try { webLookup = await tavilyCardLookup(env, provisional, google); }
+        catch (e) {
+          webLookup = { configured: true, used: true, query: buildLookupQueries(provisional, google)[0] || '', queries: [], results: [], answer: null, error: cleanError(e) };
         }
       }
 
-      // Step 3: merge the visual evidence conservatively, then allow a strong
-      // online match to fill/correct identity fields. Condition/grading data
-      // always comes from the photos, never from web listings.
-      const merged = fallbackReconcile(frontRead, backRead);
-      const guarded = guardIdentity(merged, frontRead, backRead, null);
-      let analysis = applyWebIdentity(guarded, webLookup, frontRead, backRead);
-      try { analysis = await resolveIdentityFromWeb(env, analysis, webLookup, frontRead, backRead); } catch (e) { console.warn('Web identity resolver fallback:', e); }
-      analysis = applyDeterministicIdentity(analysis, frontRead, backRead);
-      analysis.identity_confidence = Math.max(analysis.identity_confidence || 0,
-        analysis.web_match?.score >= 18 ? 94 : analysis.identity?.cardNo && analysis.identity?.subject && analysis.identity?.year ? 84 : analysis.identity?.cardNo && analysis.identity?.subject ? 76 : 60);
-      analysis.condition_confidence = Math.max(analysis.condition_confidence || 0, 60);
-      analysis.evidence = Array.from(new Set([
-        ...(analysis.evidence || []),
-        'Front/back photos used for condition analysis.',
-        ...(webLookup.used ? ['Online lookup used to verify card identity from extracted text clues.'] : [])
-      ])).slice(0, 10);
+      let identityResult;
+      try { identityResult = await resolveIdentity(env, google, provisional, webLookup); }
+      catch (e) {
+        console.warn('Identity resolver fallback:', e);
+        identityResult = deterministicIdentityFallback(google, provisional, webLookup);
+      }
+      identityResult = guardResolvedIdentity(identityResult, google, webLookup);
 
-      const query = buildQuery(analysis.identity || provisional);
+      const condition = combineCondition(frontCondition, backCondition);
+      const analysis = {
+        identity: identityResult.identity,
+        condition,
+        identity_confidence: identityResult.identity_confidence,
+        condition_confidence: condition.confidence,
+        evidence: identityResult.evidence,
+        needs_review: identityResult.needs_review,
+        review_reason: identityResult.review_reason,
+      };
+
+      const query = buildQuery(analysis.identity);
       let ebay = { configured: false, items: [], query };
-      if (env.EBAY_CLIENT_ID && env.EBAY_CLIENT_SECRET) {
-        try {
-          ebay = await ebaySearch(env, query);
-        } catch (e) {
-          ebay = { configured: true, items: [], query, error: String(e?.message || e) };
+      if (env.EBAY_CLIENT_ID && env.EBAY_CLIENT_SECRET && query) {
+        try { ebay = await ebaySearch(env, query); }
+        catch (e) { ebay = { configured: true, items: [], query, error: cleanError(e) }; }
+      }
+
+      let market = { configured: Boolean(env.TAVILY_API_KEY), items: [], query, searchUrl: ebaySearchUrl(query), source: 'none' };
+      if (query) {
+        if (ebay.configured && ebay.items?.length) {
+          market = { configured: true, items: ebay.items.slice(0, 8), query, searchUrl: ebaySearchUrl(query), source: 'eBay Browse API' };
+        } else if (env.TAVILY_API_KEY) {
+          try { market = await tavilyEbayLookup(env, analysis.identity); }
+          catch (e) { market.error = cleanError(e); }
         }
-      }
-
-      // If the refined identity materially differs, refresh eBay once.
-      if (env.EBAY_CLIENT_ID && env.EBAY_CLIENT_SECRET && query && query !== ebay.query) {
-        try { ebay = await ebaySearch(env, query); } catch {}
-      }
-
-      let market = { configured: Boolean(env.TAVILY_API_KEY), items: [], query, searchUrl: query ? `https://www.ebay.com/sch/i.html?_nkw=${encodeURIComponent(query)}` : 'https://www.ebay.com/' };
-      if (env.TAVILY_API_KEY && query) {
-        try { market = await tavilyEbayLookup(env, analysis.identity || provisional); }
-        catch (e) { market.error = String(e?.message || e); }
       }
 
       return json({
         ok: true,
         version: VERSION,
         analysis,
-        ebay: {
-          ...ebay,
-          query,
-          searchUrl: query ? `https://www.ebay.com/sch/i.html?_nkw=${encodeURIComponent(query)}` : 'https://www.ebay.com/',
-        },
+        ebay: { ...ebay, query, searchUrl: ebaySearchUrl(query) },
         market,
-        webLookup: { configured: webLookup.configured, used: webLookup.used, query: webLookup.query, results: (webLookup.results || []).slice(0, 5) },
-        privacy: 'Images were sent to Cloudflare Workers AI for visual analysis. Tavily receives only extracted text clues/search terms, not the card images. Tavily is also used to find web-indexed current eBay listings. This Worker does not save images to KV, R2, D1, or Durable Objects.',
+        googleVision: googlePublicSummary(google),
+        webLookup: {
+          configured: webLookup.configured,
+          used: webLookup.used,
+          query: webLookup.query,
+          results: (webLookup.results || []).slice(0, 6).map(x => ({ title: x.title, url: x.url, score: x.score })),
+        },
+        pipeline: {
+          identity: 'Google Vision Web Detection + Google OCR + web verification',
+          condition: 'Cloudflare Workers AI photo inspection',
+          centering: 'Calculated locally on device from card geometry/design borders',
+          grading: 'Calculated locally from published grading standards/guidelines',
+        },
+        privacy: 'Front/back images are sent transiently to Google Cloud Vision and Cloudflare Workers AI. Tavily receives text/search clues, not card images. This Worker does not write images or collection data to KV, R2, D1, or Durable Objects.',
       }, 200, cors);
     } catch (e) {
       console.error(e);
@@ -134,794 +148,636 @@ function json(data, status = 200, extra = {}) {
 }
 
 function validateImage(value, label) {
-  if (typeof value !== 'string' || !/^data:image\/(jpeg|jpg|png|webp);base64,/i.test(value)) {
-    throw new Error(`A ${label} card photo is required.`);
-  }
-  // Approximate 6 MB encoded cap per image. Frontend normally sends far less.
-  if (value.length > 8_400_000) throw new Error(`${label} photo is too large. Retake or use a smaller image.`);
+  if (typeof value !== 'string' || !/^data:image\/(jpeg|jpg|png|webp);base64,/i.test(value)) throw new Error(`A ${label} card photo is required.`);
+  if (value.length > 10_500_000) throw new Error(`${label} photo is too large. Retake or choose a smaller image.`);
   return value;
 }
 
-async function inspectSide(env, side, image) {
-  const question = `Inspect the ${side} of ONE raw collectible trading card from this image.
-
-Return SIMPLE KEY=VALUE lines, one field per line. Do NOT return markdown. If a value cannot be determined, use UNKNOWN. Never invent text.
-
-IDENTITY PRIORITY:
-1) Read exact card code/number, especially alphanumeric codes such as 91TF-2, US175, RA-TH.
-2) Read player/subject name and team.
-3) Read manufacturer/brand logo such as Topps, Panini, Bowman, Upper Deck.
-4) Read insert/set clues such as 35th Anniversary, Chrome, Prizm, etc.
-5) Read copyright/release information separately from statistics years.
-
-YEAR RULE: a stats season, birth year, draft year, or throwback design year is NOT automatically the product release year.
-CARD NUMBER RULE: never use a jersey/uniform number as the card number.
-
-CONDITION PRIORITY:
-Evaluate only what is visible in this photo. Use 1-10 in 0.5 increments for corners, edges, surface, and focus. If you cannot judge one reliably, use UNKNOWN. Do not assign a very low score unless visible damage supports it.
-Centering must be larger-side-first percentages such as 55/45. Use UNKNOWN if borderless or unreliable.
-
-Use exactly these keys:
-SIDE=${side}
-SUBJECT=
-TEAM=
-BRAND=
-SET=
-SET_CLUES=
-CARD_NUMBER=
-VARIATION=
-RELEASE_YEAR=
-YEARS_SEEN=
-CATEGORY=
-CORNERS=
-EDGES=
-SURFACE=
-FOCUS=
-CENTERING_LR=
-CENTERING_TB=
-DEFECTS=
-CONFIDENCE=
-VISIBLE_TEXT=
-NOTES=
-
-YEARS_SEEN example: 2025:stats;2026:copyright
-DEFECTS: comma-separated from crease,dent,stain,scratch,printline,mark,possible_alteration, or NONE.
-CATEGORY: Sports, TCG, Non-sport, or Other.
-VISIBLE_TEXT: semicolon-separated exact snippets you can actually read.`;
-
-  const raw = await env.AI.run(VISION_MODEL, {
-    task: 'query',
-    image,
-    question,
-    reasoning: false,
-    temperature: 0,
-    max_tokens: 1800,
-    stream: false,
-  });
-
-  const text = modelText(raw);
-  const kv = parseVisionKV(text, side);
-  if (visionReadHasUsefulClues(kv)) {
-    sanitizeConditionRead(kv);
-    return kv;
-  }
-
-  // OCR fallback: ask the OCR-focused model for plain transcription only.
-  const ocrRaw = await env.AI.run(VISION_MODEL, {
-    task: 'query',
-    image,
-    question: `Transcribe every legible word, number, card code, logo/brand name, player name, team name, anniversary/set wording, and copyright line from the ${side} of this trading card. Plain text only. Do not guess.`,
-    reasoning: false,
-    temperature: 0,
-    max_tokens: 1400,
-    stream: false,
-  });
-  const transcript = modelText(ocrRaw).trim();
-  return fallbackVisionRead(transcript || text, side);
+function stripDataUrl(value) {
+  const i = String(value || '').indexOf(',');
+  return i >= 0 ? value.slice(i + 1) : value;
 }
 
-function sanitizeConditionRead(r) {
-  const c = r?.condition;
-  if (!c) return r;
-  for (const k of ['corners','edges','surface','focus_registration']) {
-    const v = Number(c[k]);
-    if (!Number.isFinite(v) || v < 1 || v > 10) c[k] = null;
-    else c[k] = clampHalf(v, 1, 10);
-  }
-  const flags = c.defects || {};
-  const anyFlag = Object.values(flags).some(Boolean);
-  const vals = ['corners','edges','surface','focus_registration'].map(k=>c[k]).filter(v=>Number.isFinite(Number(v)));
-  // A model occasionally emits four 1s as a malformed/fallback answer. If the same
-  // response reports no visible defects, withhold condition scoring instead of
-  // inventing a damaged-card grade.
-  if (vals.length === 4 && vals.every(v=>Number(v)===1) && !anyFlag) {
-    c.corners=c.edges=c.surface=c.focus_registration=null;
-    c.photo_confidence=Math.min(Number(c.photo_confidence)||35,35);
-    c.notes=Array.from(new Set([...(c.notes||[]),'Condition scores withheld because the vision response was internally inconsistent.']));
-  }
-  return r;
-}
-
-function visionReadHasUsefulClues(r) {
-  if (!r) return false;
-  const i = r.identity || {};
-  const c = r.condition || {};
-  return Boolean(i.subject || i.card_number || i.brand || (r.visible_text || []).length || Number.isFinite(Number(c.photo_confidence)));
-}
-
-function parseVisionKV(text, side) {
-  const values = {};
-  for (const rawLine of String(text || '').split(/\r?\n/)) {
-    const line = rawLine.trim().replace(/^[-*]\s*/, '');
-    const m = line.match(/^([A-Z_]+)\s*[:=]\s*(.*)$/i);
-    if (!m) continue;
-    values[m[1].toUpperCase()] = m[2].trim();
-  }
-  const val = k => {
-    const v = values[k];
-    if (!v || /^(unknown|null|n\/a|none)$/i.test(v.trim())) return null;
-    return v.trim();
-  };
-  const num = k => {
-    const m = String(val(k) || '').match(/-?\d+(?:\.\d+)?/);
-    return m ? Number(m[0]) : null;
-  };
-  const pair = k => parsePercentPair(val(k));
-  const years = [];
-  for (const part of String(val('YEARS_SEEN') || '').split(/[;|,]+/)) {
-    const m = part.trim().match(/\b((?:19|20)\d{2})\b\s*[:=\-]?\s*([A-Za-z_ -]+)?/);
-    if (!m) continue;
-    let role = String(m[2] || 'unknown').trim().toLowerCase().replace(/\s+/g, '_');
-    const allowed = ['stats','copyright','release','design','birth','draft','unknown'];
-    if (!allowed.includes(role)) role = 'unknown';
-    years.push({ year: Number(m[1]), role });
-  }
-  const releaseYear = num('RELEASE_YEAR');
-  const defectsText = String(val('DEFECTS') || '').toLowerCase();
-  const defect = name => defectsText && !/\bnone\b/.test(defectsText) && new RegExp(`\\b${name}\\b`, 'i').test(defectsText);
-  const visible = String(val('VISIBLE_TEXT') || '').split(/\s*;\s*/).map(x=>x.trim()).filter(Boolean).slice(0,30);
-  const setClues = String(val('SET_CLUES') || '').split(/\s*;\s*|\s*\|\s*/).map(x=>x.trim()).filter(Boolean).slice(0,12);
-  const categoryRaw = val('CATEGORY');
-  const category = ['Sports','TCG','Non-sport','Other'].find(x => categoryRaw && x.toLowerCase() === categoryRaw.toLowerCase()) || null;
-  return {
-    side,
-    visible_text: visible,
-    identity: {
-      subject: val('SUBJECT'),
-      team_or_affiliation: val('TEAM'),
-      brand: normalizeBrand(val('BRAND')),
-      exact_set_or_insert: val('SET'),
-      set_clues: setClues,
-      card_number: val('CARD_NUMBER'),
-      variation_or_parallel: val('VARIATION'),
-      release_year: validYear(releaseYear),
-      years_seen: years,
-      category,
-    },
-    condition: {
-      corners: num('CORNERS'), edges: num('EDGES'), surface: num('SURFACE'), focus_registration: num('FOCUS'),
-      centering_lr: pair('CENTERING_LR'), centering_tb: pair('CENTERING_TB'),
-      defects: {
-        crease: defect('crease'), dent: defect('dent'), stain: defect('stain'), scratch: defect('scratch'),
-        printline: defect('printline'), mark: defect('mark'), possible_alteration: /possible[_ -]?alteration/i.test(defectsText),
+async function googleVisionInitial(env, front, back) {
+  const payload = {
+    requests: [
+      {
+        image: { content: stripDataUrl(front) },
+        features: [
+          { type: 'WEB_DETECTION', maxResults: 20 },
+          { type: 'TEXT_DETECTION' },
+        ],
       },
-      notes: String(val('NOTES') || '').split(/\s*;\s*/).map(x=>x.trim()).filter(Boolean).slice(0,8),
-      photo_confidence: num('CONFIDENCE'),
-    },
-  };
-}
-
-function parsePercentPair(v) {
-  if (!v) return null;
-  const m = String(v).match(/(\d{1,3}(?:\.\d+)?)\s*[/:-]\s*(\d{1,3}(?:\.\d+)?)/);
-  if (!m) return null;
-  const a = Number(m[1]), b = Number(m[2]);
-  if (!Number.isFinite(a) || !Number.isFinite(b) || a <= 0 || b <= 0) return null;
-  return normalizePair([a,b]);
-}
-
-function fallbackVisionRead(text, side) {
-  const raw = String(text || '').trim();
-  const code = extractCardCodeFromText(raw);
-  const brand = detectBrandFromText(raw);
-  const visible = raw ? raw.split(/\r?\n|\s*;\s*/).map(x=>x.trim()).filter(Boolean).slice(0,40) : [];
-  return {
-    side,
-    visible_text: visible,
-    identity: { subject:null, team_or_affiliation:null, brand, exact_set_or_insert:null, set_clues:[], card_number:code, variation_or_parallel:null, release_year:null, years_seen:[], category:null },
-    condition: { corners:null, edges:null, surface:null, focus_registration:null, centering_lr:null, centering_tb:null, defects:{crease:false,dent:false,stain:false,scratch:false,printline:false,mark:false,possible_alteration:false}, notes:['Vision response was usable only as OCR text; condition grades were withheld.'], photo_confidence:35 },
-  };
-}
-
-function provisionalIdentity(front, back, marks = null) {
-  const fi = front?.identity || {}, bi = back?.identity || {}, mi = marks || {};
-  const release = validYear(mi.release_year) || validYear(bi.release_year) || validYear(fi.release_year) || null;
-  const cardCode = extractBestCardCode(front, back) || clean(mi.card_number) || clean(bi.card_number) || clean(fi.card_number) || null;
-  return {
-    year: release,
-    brand: normalizeBrand(mi.manufacturer || bi.brand || fi.brand || detectBrandFromReads(front, back)),
-    set: clean(mi.set_or_insert) || bi.exact_set_or_insert || fi.exact_set_or_insert || null,
-    subject: clean(mi.subject) || bi.subject || fi.subject || null,
-    cardNo: cardCode,
-    variation: bi.variation_or_parallel || fi.variation_or_parallel || null,
-    team: clean(mi.team) || bi.team_or_affiliation || fi.team_or_affiliation || null,
-    category: bi.category || fi.category || null,
-  };
-}
-
-async function reconcile(env, front, back, ebayItems) {
-  const ebayTitles = ebayItems.slice(0, 8).map(x => x.title).filter(Boolean);
-  const prompt = `You reconcile front/back visual reads of ONE collectible card into a conservative pre-grade record. Return ONLY valid JSON, no markdown.
-
-Rules:
-1. Never use a stats season, birth year, draft year, or historical throwback-design year as the product release year merely because it is the largest/most prominent year. Use explicit copyright/product evidence and consistent marketplace titles when available.
-2. Card number/code is a primary identifier. Preserve punctuation/case except obvious OCR errors.
-3. eBay titles are corroborating clues only; they can be wrong. Prefer agreement across card code, manufacturer, player, and multiple titles.
-4. Exact set/insert/parallel should be specific only when evidence supports it. Otherwise use the narrowest truthful name and set needs_review=true.
-5. Condition scores should be the WORSE reasonable combined view across front/back, not an optimistic average. Photos cannot reliably prove absence of dents, micro-scratches, trimming, restoration, or hidden surface defects.
-6. Centering: use the visual estimate from each corresponding side. Output larger percentage first. If uncertain/borderless, null.
-7. Do NOT issue an official PSA/BGS/CGC/SGC grade. The app applies published grading standards separately.
-
-FRONT READ:
-${JSON.stringify(front)}
-
-BACK READ:
-${JSON.stringify(back)}
-
-CURRENT EBAY LISTING TITLES (if available):
-${JSON.stringify(ebayTitles)}
-
-Return:
-{
- "identity":{"year":number|null,"brand":string|null,"set":string|null,"subject":string|null,"cardNo":string|null,"variation":string|null,"team":string|null,"category":"Sports|TCG|Non-sport|Other|null"},
- "condition":{"corners":number,"edges":number,"surface":number,"focus":number,"front":{"lr":[number,number]|null,"tb":[number,number]|null},"back":{"lr":[number,number]|null,"tb":[number,number]|null},"defects":{"crease":boolean,"dent":boolean,"stain":boolean,"scratch":boolean,"printline":boolean,"mark":boolean,"possible_alteration":boolean},"notes":["..."]},
- "identity_confidence":number,
- "condition_confidence":number,
- "evidence":["..."],
- "needs_review":boolean,
- "review_reason":string|null
-}`;
-
-  const raw = await env.AI.run(TEXT_MODEL, {
-    messages: [
-      { role: 'system', content: 'You are a conservative trading-card identification and pre-grading reconciliation engine. Return one valid JSON object only.' },
-      { role: 'user', content: prompt },
+      {
+        image: { content: stripDataUrl(back) },
+        features: [{ type: 'DOCUMENT_TEXT_DETECTION' }],
+      },
     ],
-    response_format: { type: 'json_object' },
-    temperature: 0.05,
-    max_tokens: 1800,
-    stream: false,
-  });
-
-  // Cloudflare JSON Mode may return the structured object under `response`
-  // instead of as plain text. Accept both shapes. If reconciliation ever
-  // fails, fall back to a conservative deterministic merge rather than
-  // throwing away the entire card analysis.
-  try {
-    const result = structuredModelResult(raw, 'reconciliation');
-    return normalizeAnalysis(result, front, back);
-  } catch (e) {
-    console.warn('Reconciliation fallback:', e);
-    return fallbackReconcile(front, back);
-  }
-}
-
-
-function structuredModelResult(raw, label) {
-  if (!raw) throw new Error(`${label} returned no result.`);
-  if (raw.response && typeof raw.response === 'object' && !Array.isArray(raw.response)) return raw.response;
-  if (raw.result && typeof raw.result === 'object' && !Array.isArray(raw.result)) return raw.result;
-  const msg = raw.choices?.[0]?.message;
-  if (msg?.parsed && typeof msg.parsed === 'object') return msg.parsed;
-  if (typeof msg?.content === 'string') return parseModelJSON(msg.content, label);
-  if (typeof raw.response === 'string') return parseModelJSON(raw.response, label);
-  if (typeof raw.answer === 'string') return parseModelJSON(raw.answer, label);
-  return parseModelJSON(modelText(raw), label);
-}
-
-
-function allReadText(front, back) {
-  const vals = [];
-  for (const r of [front, back]) {
-    if (!r) continue;
-    const i = r.identity || {};
-    vals.push(i.card_number, i.subject, i.brand, i.exact_set_or_insert, i.team_or_affiliation);
-    if (Array.isArray(i.set_clues)) vals.push(...i.set_clues);
-    if (Array.isArray(r.visible_text)) vals.push(...r.visible_text);
-  }
-  return vals.filter(Boolean).map(String);
-}
-
-function extractBestCardCode(front, back) {
-  const texts = allReadText(front, back);
-  const candidates = [];
-  const add = (raw, score) => {
-    const v = clean(raw);
-    if (!v) return;
-    const u = v.replace(/^#/, '').toUpperCase();
-    if (!/[A-Z]/.test(u) && /^\d{1,3}$/.test(u)) return;
-    if (u.length < 2 || u.length > 20) return;
-    candidates.push({v:u, score});
   };
-  for (const r of [back, front]) {
-    const c = r?.identity?.card_number;
-    if (c) add(c, /[A-Z].*\d|\d.*[A-Z]/i.test(c) ? 100 : 35);
-  }
-  const rx = /\b[A-Z0-9]{1,8}-[A-Z0-9]{1,8}\b/gi;
-  const rx2 = /\b(?=[A-Z0-9]{3,12}\b)(?=[A-Z0-9]*[A-Z])(?=[A-Z0-9]*\d)[A-Z0-9]{3,12}\b/gi;
-  for (const t of texts) {
-    for (const m of String(t).match(rx) || []) add(m, 120);
-    for (const m of String(t).match(rx2) || []) add(m, 70);
-  }
-  candidates.sort((a,b)=>b.score-a.score || b.v.length-a.v.length);
-  return candidates[0]?.v || null;
-}
-
-function detectBrandFromReads(front, back) {
-  const t = allReadText(front, back).join(' ');
-  if (/\btopps\b/i.test(t)) return 'Topps';
-  if (/\bpanini\b/i.test(t)) return 'Panini';
-  if (/\bbowman\b/i.test(t)) return 'Bowman';
-  if (/\bupper\s+deck\b/i.test(t)) return 'Upper Deck';
-  if (/\bfleer\b/i.test(t)) return 'Fleer';
-  if (/\bdonruss\b/i.test(t)) return 'Donruss';
-  return null;
-}
-
-function applyDeterministicIdentity(out, front, back) {
-  const code = extractBestCardCode(front, back);
-  if (code) out.identity.cardNo = code;
-
-  const text = allReadText(front, back).join(' ');
-  const detectedBrand = detectBrandFromReads(front, back);
-  if (detectedBrand) out.identity.brand = detectedBrand;
-
-  if (/^91TF-\w+/i.test(code || '') && /35(?:th)?\s*anniversary/i.test(text)) {
-    out.identity.brand = 'Topps';
-    out.identity.year = 2026;
-    out.identity.set = '1991 Topps Football 35th Anniversary';
-    out.needs_review = false;
-    out.review_reason = null;
-    out.evidence = Array.from(new Set([...(out.evidence||[]), `Card code ${code}`, '35th Anniversary design cue']));
-  }
-
-  const years = [...(front?.identity?.years_seen || []), ...(back?.identity?.years_seen || [])];
-  const y = Number(out.identity.year);
-  if (y && !/^91TF-/i.test(code || '')) {
-    const roles = years.filter(x => Number(x?.year) === y).map(x => String(x?.role || 'unknown'));
-    if (roles.length && roles.every(r => ['stats','birth','draft','design','unknown','copyright'].includes(r)) && roles.includes('stats')) {
-      out.identity.year = null;
-      out.needs_review = true;
-      out.review_reason = cleanJoin(out.review_reason, `${y} is supported only by non-release evidence.`);
-    }
-  }
-  return out;
-}
-
-function fallbackReconcile(front, back) {
-  const fi = front?.identity || {}, bi = back?.identity || {};
-  const fc = front?.condition || {}, bc = back?.condition || {};
-  const choose = (a, b) => clean(a) || clean(b) || null;
-  const worse = (a, b) => {
-    const vals = [Number(a), Number(b)].filter(Number.isFinite);
-    return vals.length ? clampHalf(Math.min(...vals), 1, 10) : null;
-  };
-  const defects = {};
-  for (const k of ['crease','dent','stain','scratch','printline','mark','possible_alteration']) {
-    defects[k] = Boolean(fc.defects?.[k] || bc.defects?.[k]);
-  }
-  const years = [...(fi.years_seen || []), ...(bi.years_seen || [])];
-  let year = Number(bi.release_year || fi.release_year) || null;
-  // If the card itself says it is a 35th-anniversary treatment of a 1991 design,
-  // 1991 + 35 = 2026 is a strong product-year clue. This also prevents a 2025
-  // statistics heading from being mistaken for the release year.
-  const clues = [fi.exact_set_or_insert, bi.exact_set_or_insert, ...(fi.set_clues||[]), ...(bi.set_clues||[]), ...(front?.visible_text||[]), ...(back?.visible_text||[])].join(' ');
-  if (/35(?:th)?\s+anniversary/i.test(clues) && /1991/i.test(clues)) year = 2026;
-  if (!year) {
-    const release = years.find(x => x?.role === 'release');
-    if (release?.year) year = Number(release.year);
-  }
-  return normalizeAnalysis({
-    identity: {
-      year,
-      brand: normalizeBrand(detectBrandFromReads(front, back) || choose(bi.brand, fi.brand)),
-      set: choose(bi.exact_set_or_insert, fi.exact_set_or_insert),
-      subject: choose(bi.subject, fi.subject),
-      cardNo: extractBestCardCode(front, back) || choose(bi.card_number, fi.card_number),
-      variation: choose(bi.variation_or_parallel, fi.variation_or_parallel),
-      team: choose(bi.team_or_affiliation, fi.team_or_affiliation),
-      category: bi.category || fi.category || 'Other',
-    },
-    condition: {
-      corners: worse(fc.corners, bc.corners),
-      edges: worse(fc.edges, bc.edges),
-      surface: worse(fc.surface, bc.surface),
-      focus: worse(fc.focus_registration, bc.focus_registration),
-      front: { lr: fc.centering_lr || null, tb: fc.centering_tb || null },
-      back: { lr: bc.centering_lr || null, tb: bc.centering_tb || null },
-      defects,
-      notes: ['Front and back visual reads were combined conservatively. Photo-only grading cannot confirm hidden or microscopic defects.'],
-    },
-    identity_confidence: (extractBestCardCode(front, back) && choose(bi.subject, fi.subject)) ? 78 : 55,
-    condition_confidence: Math.round(([fc.photo_confidence, bc.photo_confidence].map(Number).filter(Number.isFinite).reduce((a,b)=>a+b,0) / Math.max(1,[fc.photo_confidence, bc.photo_confidence].map(Number).filter(Number.isFinite).length)) || 0),
-    evidence: ['Front/back vision reads were merged conservatively.'],
-    needs_review: !(extractBestCardCode(front, back) && choose(bi.subject, fi.subject)),
-    review_reason: (extractBestCardCode(front, back) && choose(bi.subject, fi.subject)) ? null : 'Automatic identity needs stronger corroboration.', 
-  }, front, back);
-}
-
-function guardIdentity(analysis, front, back, marks = null) {
-  const out = structuredClone(analysis);
-  const fi = front?.identity || {}, bi = back?.identity || {}, mi = marks || {};
-
-  // Normalize common stylized/OCR manufacturer errors (e.g. TRAPS -> Topps).
-  out.identity.brand = normalizeBrand(mi.manufacturer || out.identity.brand || bi.brand || fi.brand);
-
-  // Prefer the focused legal-line read over prominent statistics years.
-  const yearEvidence = [...(fi.years_seen || []), ...(bi.years_seen || [])];
-  const releaseEvidence = yearEvidence.find(x => String(x?.role || '') === 'release' && validYear(x?.year));
-  const strongYear = validYear(mi.release_year) || validYear(releaseEvidence?.year);
-  if (strongYear) {
-    if (out.identity.year && out.identity.year !== strongYear) {
-      out.needs_review = true;
-      out.review_reason = cleanJoin(out.review_reason, `Year corrected to ${strongYear} from focused copyright/product evidence.`);
-    }
-    out.identity.year = strongYear;
-  } else {
-    const allYears = [...(fi.years_seen || []), ...(bi.years_seen || [])];
-    const y = Number(out.identity.year);
-    if (y) {
-      const rolesForY = allYears.filter(x => Number(x?.year) === y).map(x => String(x?.role || 'unknown'));
-      const onlyNonRelease = rolesForY.length && rolesForY.every(r => ['stats','birth','draft','design','unknown'].includes(r));
-      if (onlyNonRelease && rolesForY.includes('stats')) {
-        out.identity.year = null;
-        out.needs_review = true;
-        out.review_reason = cleanJoin(out.review_reason, `${y} appears only as a statistics year, so it was not used as the product year.`);
-      }
-    }
-  }
-
-  if (mi.card_number) out.identity.cardNo = clean(mi.card_number);
-  if (mi.subject) out.identity.subject = clean(mi.subject);
-  if (mi.team) out.identity.team = clean(mi.team);
-  if (mi.set_or_insert && !out.identity.set) out.identity.set = clean(mi.set_or_insert);
-
-  // Known 1991 Topps Football anniversary code family. The code itself plus
-  // the 35th Anniversary front badge is stronger than a stats-year heading.
-  const clueText = [out.identity.cardNo, out.identity.set, ...(fi.set_clues||[]), ...(bi.set_clues||[]), ...(mi.evidence||[]), ...(front?.visible_text||[]), ...(back?.visible_text||[])].filter(Boolean).join(' ');
-  if (/^91TF-/i.test(out.identity.cardNo || '') && /35(?:th)?\s*anniversary/i.test(clueText)) {
-    out.identity.brand = 'Topps';
-    out.identity.year = 2026;
-    if (!out.identity.set || /traps/i.test(out.identity.set)) out.identity.set = '1991 Topps Football 35th Anniversary';
-  }
-
-  return applyDeterministicIdentity(out, front, back);
-}
-
-function normalizeBrand(value) {
-  const raw = clean(value);
-  if (!raw) return null;
-  const brands = ['Topps','Panini','Bowman','Upper Deck','Fleer','Donruss','Score','Leaf'];
-  const n = normalizeToken(raw);
-  for (const b of brands) {
-    const bn = normalizeToken(b);
-    if (n === bn) return b;
-    if (Math.abs(n.length - bn.length) <= 1 && levenshtein(n, bn) <= 2) return b;
-  }
-  return raw;
-}
-function normalizeToken(s) { return String(s).toLowerCase().replace(/[^a-z0-9]/g, '').replace(/0/g,'o').replace(/5/g,'s'); }
-function levenshtein(a,b) {
-  const m=Array.from({length:b.length+1},(_,i)=>i);
-  for (let i=1;i<=a.length;i++) {
-    let prev=m[0]; m[0]=i;
-    for (let j=1;j<=b.length;j++) {
-      const tmp=m[j];
-      m[j]=Math.min(m[j]+1,m[j-1]+1,prev+(a[i-1]===b[j-1]?0:1));
-      prev=tmp;
-    }
-  }
-  return m[b.length];
-}
-function validYear(v) { const n=Number(v); return Number.isInteger(n) && n>=1880 && n<=2100 ? n : null; }
-function cleanJoin(a,b) { return [clean(a),clean(b)].filter(Boolean).join(' '); }
-
-function normalizeAnalysis(a, front, back) {
-  const identity = a.identity || {};
-  const c = a.condition || {};
-  const clampScore = v => { const n = Number(v); return Number.isFinite(n) ? clampHalf(n, 1, 10) : null; };
-  const pair = p => Array.isArray(p) && p.length === 2 && p.every(Number.isFinite) ? normalizePair(p) : null;
+  const data = await googleVisionRequest(env, payload);
+  const responses = data.responses || [];
   return {
-    identity: {
-      year: identity.year ? Number(identity.year) : null,
-      brand: normalizeBrand(identity.brand), set: clean(identity.set), subject: clean(identity.subject),
-      cardNo: clean(identity.cardNo), variation: clean(identity.variation), team: clean(identity.team),
-      category: ['Sports','TCG','Non-sport','Other'].includes(identity.category) ? identity.category : 'Other',
-    },
-    condition: {
-      corners: clampScore(c.corners), edges: clampScore(c.edges), surface: clampScore(c.surface), focus: clampScore(c.focus),
-      front: { lr: pair(c.front?.lr) || pair(front?.condition?.centering_lr), tb: pair(c.front?.tb) || pair(front?.condition?.centering_tb) },
-      back: { lr: pair(c.back?.lr) || pair(back?.condition?.centering_lr), tb: pair(c.back?.tb) || pair(back?.condition?.centering_tb) },
-      defects: {
-        crease: Boolean(c.defects?.crease), dent: Boolean(c.defects?.dent), stain: Boolean(c.defects?.stain), scratch: Boolean(c.defects?.scratch),
-        printline: Boolean(c.defects?.printline), mark: Boolean(c.defects?.mark), possible_alteration: Boolean(c.defects?.possible_alteration),
-      },
-      notes: Array.isArray(c.notes) ? c.notes.map(clean).filter(Boolean).slice(0, 8) : [],
-    },
-    identity_confidence: clamp(Number(a.identity_confidence) || 0, 0, 100),
-    condition_confidence: clamp(Number(a.condition_confidence) || 0, 0, 100),
-    evidence: Array.isArray(a.evidence) ? a.evidence.map(clean).filter(Boolean).slice(0, 10) : [],
-    needs_review: Boolean(a.needs_review),
-    review_reason: clean(a.review_reason),
+    front: parseGoogleResponse(responses[0], 'front'),
+    back: parseGoogleResponse(responses[1], 'back'),
   };
 }
 
-function modelText(raw) {
-  if (typeof raw === 'string') return raw;
-  if (!raw) return '';
-  if (typeof raw.answer === 'string') return raw.answer;
-  if (typeof raw.response === 'string') return raw.response;
-  if (typeof raw.result === 'string') return raw.result;
-  const content = raw.choices?.[0]?.message?.content;
-  if (typeof content === 'string') return content;
-  if (Array.isArray(content)) return content.map(x => x?.text || '').join('\n');
-  return JSON.stringify(raw);
+async function googleVisionWebOnly(env, image) {
+  const payload = { requests: [{ image: { content: stripDataUrl(image) }, features: [{ type: 'WEB_DETECTION', maxResults: 20 }] }] };
+  const data = await googleVisionRequest(env, payload);
+  return parseGoogleResponse(data.responses?.[0], 'back');
 }
 
-function parseModelJSON(text, label) {
-  if (typeof text !== 'string') throw new Error(`${label} returned no text.`);
-  const cleaned = text.trim().replace(/^```(?:json)?\s*/i, '').replace(/\s*```$/i, '');
-  try { return JSON.parse(cleaned); } catch {}
-  const start = cleaned.indexOf('{'), end = cleaned.lastIndexOf('}');
-  if (start >= 0 && end > start) {
-    try { return JSON.parse(cleaned.slice(start, end + 1)); } catch {}
-  }
-  throw new Error(`${label} returned an unreadable response. Try clearer photos.`);
-}
-
-function buildQuery(i = {}) {
-  return [i.year, i.brand, i.set, i.subject, i.cardNo, i.variation].filter(Boolean).join(' ').replace(/\s+/g, ' ').trim();
-}
-
-
-async function tavilyCardLookup(env, provisional, front, back) {
-  const queries = buildLookupQueries(provisional, front, back);
-  if (!queries.length) return { configured: true, used: false, query: '', queries: [], results: [], answer: null };
-  const batches = await Promise.all(queries.slice(0, 3).map(q => tavilySearch(env, q, 8)));
-  const byUrl = new Map();
-  for (const b of batches) for (const x of b.results || []) {
-    const key = x.url || `${x.title}|${x.content}`;
-    if (!byUrl.has(key) || (byUrl.get(key).score || 0) < (x.score || 0)) byUrl.set(key, x);
-  }
-  return {
-    configured: true, used: true, query: queries[0], queries,
-    answer: batches.map(x => x.answer).filter(Boolean).join(' | ') || null,
-    results: [...byUrl.values()].sort((a,b)=>(b.score||0)-(a.score||0)).slice(0, 12),
-  };
-}
-
-async function tavilySearch(env, query, maxResults = 8, includeDomains = null) {
-  const body = { query, topic: 'general', search_depth: 'basic', max_results: maxResults, include_answer: true, include_raw_content: false, include_images: false };
-  if (includeDomains?.length) body.include_domains = includeDomains;
-  const r = await fetch('https://api.tavily.com/search', {
+async function googleVisionRequest(env, payload) {
+  const r = await fetch(`${GOOGLE_VISION_URL}?key=${encodeURIComponent(env.GOOGLE_VISION_API_KEY)}`, {
     method: 'POST',
-    headers: { 'Authorization': `Bearer ${env.TAVILY_API_KEY}`, 'Content-Type': 'application/json', 'Accept': 'application/json' },
-    body: JSON.stringify(body),
+    headers: { 'Content-Type': 'application/json; charset=utf-8', 'Accept': 'application/json' },
+    body: JSON.stringify(payload),
   });
+  const text = await r.text();
+  let data = {};
+  try { data = text ? JSON.parse(text) : {}; } catch {}
   if (!r.ok) {
-    const t = await r.text().catch(() => '');
-    throw new Error(`Tavily search ${r.status}${t ? `: ${t.slice(0, 180)}` : ''}`);
+    const message = data?.error?.message || text.slice(0, 300) || `HTTP ${r.status}`;
+    throw new Error(`Google Vision ${r.status}: ${message}`);
   }
-  const j = await r.json();
-  return { answer: clean(j.answer), results: (j.results || []).map(x => ({ title: clean(x.title), url: clean(x.url), content: clean(x.content), score: Number(x.score) || 0 })) };
+  for (const x of data.responses || []) {
+    if (x?.error?.message) throw new Error(`Google Vision: ${x.error.message}`);
+  }
+  return data;
 }
 
-function buildLookupQueries(i = {}, front, back) {
-  const rawText = allReadText(front, back).join(' ');
-  const code = i.cardNo || extractCardCodeFromText(rawText);
-  const subject = i.subject || front?.identity?.subject || back?.identity?.subject || '';
-  const brand = normalizeBrand(i.brand || detectBrandFromReads(front, back)) || '';
-  const setClues = [...(front?.identity?.set_clues || []), ...(back?.identity?.set_clues || [])].filter(Boolean).slice(0,3).join(' ');
-  const q=[];
-  if (code) { q.push([`"${code}"`, subject && `"${subject}"`, brand, 'trading card checklist set year'].filter(Boolean).join(' ')); q.push([`"${code}"`, subject && `"${subject}"`, 'TCDB Beckett Topps'].filter(Boolean).join(' ')); }
-  if (subject) q.push([`"${subject}"`, code && `"${code}"`, brand, i.set || setClues, 'trading card'].filter(Boolean).join(' '));
-  if (!q.length && rawText) q.push(`${rawText.slice(0,220)} trading card identify set card number`);
-  return [...new Set(q.map(x=>x.replace(/\s+/g,' ').trim()).filter(Boolean))];
-}
-
-function buildLookupQuery(i = {}, front, back) { return buildLookupQueries(i, front, back)[0] || ''; }
-
-function applyWebIdentity(analysis, web, front, back) {
-  const out = structuredClone(analysis);
-  if (!web?.used || !(web.results || []).length) return out;
-  const base = out.identity || {};
-  const scored = web.results.map(r => ({ ...r, matchScore: scoreWebResult(r, base, front, back) }))
-    .sort((a,b) => b.matchScore - a.matchScore || b.score - a.score);
-  const best = scored[0];
-  if (!best || best.matchScore < 8) {
-    out.needs_review = true;
-    out.review_reason = cleanJoin(out.review_reason, 'Online search did not find a strong exact-card match.');
-    return out;
-  }
-
-  const evidenceText = [best.title, best.content, web.answer].filter(Boolean).join(' | ');
-  const cardNo = base.cardNo || extractCardCodeFromText(evidenceText);
-  const subject = base.subject || extractSubjectFromBest(best, front, back);
-  const brand = normalizeBrand(base.brand || detectBrandFromText(evidenceText));
-  const year = chooseWebYear(best, web.answer, base.year, cardNo, subject);
-  const set = chooseWebSet(best, brand, year, subject, cardNo, base.set);
-
-  if (cardNo) base.cardNo = cardNo;
-  if (subject) base.subject = subject;
-  if (brand) base.brand = brand;
-  if (year) base.year = year;
-  if (set) base.set = set;
-
-  out.identity = base;
-  out.web_match = {
-    score: best.matchScore, title: best.title, url: best.url,
+function parseGoogleResponse(r, side) {
+  r ||= {};
+  const web = r.webDetection || {};
+  const textAnnotations = Array.isArray(r.textAnnotations) ? r.textAnnotations : [];
+  const fullText = cleanLong(r.fullTextAnnotation?.text || textAnnotations[0]?.description || '', 12000);
+  return {
+    side,
+    fullText,
+    lines: fullText ? fullText.split(/\r?\n/).map(x => x.trim()).filter(Boolean).slice(0, 160) : [],
+    web: {
+      bestGuessLabels: (web.bestGuessLabels || []).map(x => clean(x.label)).filter(Boolean).slice(0, 8),
+      entities: (web.webEntities || []).map(x => ({ description: clean(x.description), score: Number(x.score) || 0 })).filter(x => x.description).sort((a,b)=>b.score-a.score).slice(0, 20),
+      pages: (web.pagesWithMatchingImages || []).map(x => ({
+        url: cleanLong(x.url, 1200),
+        title: clean(x.pageTitle),
+        fullMatchingImages: (x.fullMatchingImages || []).map(y => cleanLong(y.url, 1200)).filter(Boolean).slice(0, 5),
+        partialMatchingImages: (x.partialMatchingImages || []).map(y => cleanLong(y.url, 1200)).filter(Boolean).slice(0, 5),
+      })).filter(x => x.url).slice(0, 20),
+      fullMatchingImages: (web.fullMatchingImages || []).map(x => cleanLong(x.url, 1200)).filter(Boolean).slice(0, 20),
+      partialMatchingImages: (web.partialMatchingImages || []).map(x => cleanLong(x.url, 1200)).filter(Boolean).slice(0, 20),
+      visuallySimilarImages: (web.visuallySimilarImages || []).map(x => cleanLong(x.url, 1200)).filter(Boolean).slice(0, 20),
+    },
   };
-  if (best.matchScore >= 18 && base.cardNo && base.subject) {
-    out.needs_review = false;
-    out.review_reason = null;
-    out.evidence = Array.from(new Set([...(out.evidence || []), `Online exact-match: ${best.title}`])).slice(0, 10);
-  } else {
-    out.needs_review = true;
-    out.review_reason = cleanJoin(out.review_reason, 'Online match found but should be reviewed before professional grading.');
-  }
-  return applyDeterministicIdentity(out, front, back);
 }
 
-async function resolveIdentityFromWeb(env, analysis, web, front, back) {
-  if (!web?.results?.length) return analysis;
-  const clues = {
-    visualIdentity: analysis.identity || {},
-    cardCode: extractBestCardCode(front, back),
-    visibleText: allReadText(front, back).slice(0, 30),
-    searchAnswer: web.answer,
-    searchResults: web.results.slice(0, 10).map(x => ({title:x.title,url:x.url,content:x.content})),
-  };
-  const prompt = `Identify ONE collectible trading card from visual text clues plus live web search results. Return ONLY valid JSON. Do not use a statistics season as the product release year. Treat an alphanumeric card code (example 91TF-2) as stronger evidence than a jersey number. Prefer exact checklist/manufacturer/database matches across multiple sources. If a field is not supportable, use null.\n\nINPUT:\n${JSON.stringify(clues)}\n\nRETURN:\n{"year":number|null,"brand":string|null,"set":string|null,"subject":string|null,"cardNo":string|null,"variation":string|null,"team":string|null,"category":"Sports|TCG|Non-sport|Other|null","confidence":number,"evidence":["..."]}`;
-  const raw = await env.AI.run(TEXT_MODEL, {
-    messages:[{role:'system',content:'You identify trading cards from corroborated web evidence. Return one JSON object only.'},{role:'user',content:prompt}],
-    response_format:{type:'json_object'},
-    temperature:0.02,max_tokens:900,stream:false
+function googleWebStrength(read) {
+  const w = read?.web || {};
+  let score = 0;
+  if ((w.fullMatchingImages || []).length) score += 3;
+  if ((w.pages || []).length) score += 2;
+  if ((w.partialMatchingImages || []).length) score += 1;
+  if ((w.bestGuessLabels || []).length) score += 1;
+  return score;
+}
+
+function combineGoogleEvidence(initial, backWebFallback) {
+  const front = structuredClone(initial.front || { side: 'front', fullText: '', lines: [], web: {} });
+  const back = structuredClone(initial.back || { side: 'back', fullText: '', lines: [], web: {} });
+  if (backWebFallback?.web) back.web = backWebFallback.web;
+  return { front, back, backWebFallbackUsed: Boolean(backWebFallback) };
+}
+
+function googlePublicSummary(g) {
+  const summarize = r => ({
+    ocrText: cleanLong(r?.fullText || '', 1600),
+    bestGuessLabels: r?.web?.bestGuessLabels || [],
+    webEntities: (r?.web?.entities || []).slice(0, 8),
+    matchingPages: (r?.web?.pages || []).slice(0, 8).map(x => ({ title: x.title, url: x.url })),
+    fullMatchCount: (r?.web?.fullMatchingImages || []).length,
+    partialMatchCount: (r?.web?.partialMatchingImages || []).length,
   });
-  const obj = structuredModelResult(raw, 'web identity');
-  const out = structuredClone(analysis);
-  out.identity ||= {};
-  for (const k of ['year','brand','set','subject','cardNo','variation','team','category']) if (obj[k] !== null && obj[k] !== undefined && obj[k] !== '') out.identity[k] = k==='brand' ? normalizeBrand(obj[k]) : obj[k];
-  out.identity_confidence = clamp(Number(obj.confidence)||out.identity_confidence||0,0,100);
-  out.evidence = Array.from(new Set([...(out.evidence||[]), ...(Array.isArray(obj.evidence)?obj.evidence:[])])).slice(0,10);
-  if (out.identity.cardNo && out.identity.subject && out.identity.year && out.identity.set && out.identity_confidence >= 75) { out.needs_review=false; out.review_reason=null; }
-  return out;
+  return { configured: true, used: true, backWebFallbackUsed: g.backWebFallbackUsed, front: summarize(g.front), back: summarize(g.back) };
 }
 
-async function tavilyEbayLookup(env, identity = {}) {
-  const query = buildQuery(identity);
-  const searchUrl = query ? `https://www.ebay.com/sch/i.html?_nkw=${encodeURIComponent(query)}` : 'https://www.ebay.com/';
-  if (!query) return {configured:true,items:[],query,searchUrl};
-  const q = `${query} current eBay listing`;
-  const b = await tavilySearch(env, q, 8, ['ebay.com']);
-  const items = (b.results||[]).slice(0,6).map(x=>({title:x.title,url:x.url,price:extractPrice(`${x.title||''} ${x.content||''}`),content:x.content}));
-  return {configured:true,items,query,searchUrl,source:'Tavily web-indexed eBay results'};
-}
-function extractPrice(text){const m=String(text||'').match(/\$\s*([0-9]{1,6}(?:\.[0-9]{2})?)/);return m?Number(m[1].replace(/,/g,'')):null;}
-
-function scoreWebResult(r, i, front, back) {
-  const t = `${r.title || ''} ${r.content || ''}`.toLowerCase();
-  let s = 0;
-  const has = v => v && t.includes(String(v).toLowerCase());
-  const readCode = extractBestCardCode(front, back);
-  const readSubject = front?.identity?.subject || back?.identity?.subject;
-  const readBrand = detectBrandFromReads(front, back);
-  if (has(i.cardNo || readCode)) s += 12;
-  if (has(i.subject || readSubject)) s += 8;
-  if (has(i.brand || readBrand)) s += 4;
-  if (has(i.set)) s += 5;
-  const clueText = allReadText(front, back).join(' ');
-  if (/35(?:th)?\s*anniversary/i.test(clueText) && /35(?:th)?\s*anniversary/i.test(t)) s += 3;
-  if (/beckett\.com|tcdb\.com|tradingcarddb\.com|cardboardconnection\.com|topps\.com|psacard\.com/i.test(r.url || '')) s += 3;
-  s += Math.min(2, Math.max(0, Number(r.score) || 0) * 2);
-  return Math.round(s * 10) / 10;
+function allGoogleText(g) {
+  return [g?.front?.fullText, g?.back?.fullText].filter(Boolean).join('\n');
 }
 
-function chooseWebYear(best, answer, current, cardNo, subject) {
-  const title = String(best?.title || '');
-  const text = `${title} ${best?.content || ''} ${answer || ''}`;
-  const titleYears = (title.match(/\b(?:19|20)\d{2}\b/g) || []).map(Number);
-  if (titleYears.length) {
-    if (/35(?:th)?\s*anniversary/i.test(text) && titleYears.length > 1) return Math.max(...titleYears.filter(validYear));
-    const first = validYear(titleYears[0]);
-    if (first) return first;
+function allGoogleWebText(g) {
+  const parts = [];
+  for (const r of [g?.front, g?.back]) {
+    const w = r?.web || {};
+    parts.push(...(w.bestGuessLabels || []));
+    parts.push(...(w.entities || []).map(x => x.description));
+    parts.push(...(w.pages || []).map(x => `${x.title || ''} ${x.url || ''}`));
   }
-  const all = (text.match(/\b(?:19|20)\d{2}\b/g) || []).map(Number).filter(validYear);
-  if (all.length) {
-    const recent = all.filter(y => y >= 2000);
-    if (recent.length) return Math.max(...recent);
-    return all[0];
+  return parts.filter(Boolean).join(' | ');
+}
+
+function extractCardCandidates(text) {
+  const raw = String(text || '').toUpperCase();
+  const out = new Map();
+  const add = (v, score) => {
+    v = String(v || '').replace(/^#/, '').trim();
+    if (!v || v.length > 24) return;
+    if (!/[0-9]/.test(v)) return;
+    if (/^(19|20)\d{2}$/.test(v)) return;
+    if (/^\d{1,2}$/.test(v)) return; // likely jersey/stat number, not enough evidence by itself
+    const old = out.get(v) || 0;
+    out.set(v, Math.max(old, score));
+  };
+  for (const m of raw.match(/\b[A-Z0-9]{1,10}-[A-Z0-9]{1,10}(?:-[A-Z0-9]{1,8})?\b/g) || []) add(m, 120);
+  for (const m of raw.match(/\b(?=[A-Z0-9]{3,16}\b)(?=[A-Z0-9]*[A-Z])(?=[A-Z0-9]*\d)[A-Z0-9]{3,16}\b/g) || []) add(m, 70);
+  for (const m of raw.match(/(?:CARD\s*(?:NO\.?|NUMBER|#)\s*[:#-]?\s*)([A-Z0-9-]{1,18})/g) || []) {
+    const x = m.replace(/^.*?(?:NO\.?|NUMBER|#)\s*[:#-]?\s*/i, ''); add(x, 100);
   }
-  return validYear(current);
-}
-
-function chooseWebSet(best, brand, year, subject, cardNo, current) {
-  let title = clean(best?.title);
-  if (!title) return current || null;
-  title = title.replace(/\s*[|–—]\s*(eBay|Beckett|Trading Card Database|TCDB|PSA).*$/i, '');
-  if (subject) title = title.replace(new RegExp(escapeRegex(subject), 'ig'), '');
-  if (cardNo) title = title.replace(new RegExp(`#?${escapeRegex(cardNo)}`, 'ig'), '');
-  if (year) title = title.replace(new RegExp(`\\b${year}\\b`, 'g'), '');
-  if (brand) title = title.replace(new RegExp(`\\b${escapeRegex(brand)}\\b`, 'ig'), '');
-  title = title.replace(/\b(card|football card|basketball card|baseball card)\b/ig, ' ')
-    .replace(/^[\s:#|–—-]+|[\s:#|–—-]+$/g, '').replace(/\s+/g, ' ').trim();
-  if (title.length >= 4 && title.length <= 120) return title;
-  return current || null;
-}
-
-function extractCardCodeFromText(text) {
-  const rx = /\b[A-Z0-9]{1,8}-[A-Z0-9]{1,8}\b/gi;
-  const m = String(text || '').match(rx);
-  return m?.[0]?.toUpperCase() || null;
+  for (const m of raw.match(/#\s*([0-9]{3,4})\b/g) || []) add(m.replace(/#\s*/, ''), 85);
+  for (const m of raw.match(/\bNO\.?\s*[:#-]?\s*([0-9]{3,4})\b/g) || []) add(m.replace(/^.*?NO\.?\s*[:#-]?\s*/i, ''), 85);
+  return [...out.entries()].map(([value, score]) => ({ value, score })).sort((a,b)=>b.score-a.score || b.value.length-a.value.length);
 }
 
 function detectBrandFromText(text) {
   const t = String(text || '');
-  for (const b of ['Topps','Panini','Bowman','Upper Deck','Fleer','Donruss','Score','Leaf']) {
-    if (new RegExp(`\\b${escapeRegex(b)}\\b`, 'i').test(t)) return b;
-  }
+  const brands = ['Topps','Panini','Bowman','Upper Deck','Fleer','Donruss','Score','Leaf','O-Pee-Chee','SkyBox','Pacific'];
+  for (const b of brands) if (new RegExp(`\\b${escapeRegex(b).replace(/\\ /g,'\\s+')}\\b`, 'i').test(t)) return b;
   return null;
 }
 
-function extractSubjectFromBest(best, front, back) {
-  const known = [front?.identity?.subject, back?.identity?.subject].map(clean).filter(Boolean);
-  for (const s of known) if ((best.title || '').toLowerCase().includes(s.toLowerCase())) return s;
-  return known[0] || null;
+function extractYearsWithContext(text) {
+  const raw = String(text || '');
+  const years = [];
+  const re = /\b((?:19|20)\d{2})\b/g;
+  let m;
+  while ((m = re.exec(raw))) {
+    const year = Number(m[1]);
+    const before = raw.slice(Math.max(0, m.index - 50), m.index).toLowerCase();
+    const after = raw.slice(m.index + 4, Math.min(raw.length, m.index + 65)).toLowerCase();
+    const nearBefore = raw.slice(Math.max(0, m.index - 20), m.index).toLowerCase();
+    const nearAfter = raw.slice(m.index + 4, Math.min(raw.length, m.index + 42)).toLowerCase();
+    const ctx = `${before} ${after}`;
+    let role = 'unknown';
+    // Use proximity, not the whole nearby line: a stats year is often only a few
+    // characters away from a separate copyright year on card backs.
+    if (/(?:©|copyright|\bcopr\b)\s*$/.test(nearBefore) || /^\s*(?:copyright|all rights reserved|the .* company|topps|panini|upper deck)/.test(nearAfter)) role = 'copyright';
+    else if (/stats?|statistics|receiving|passing|rushing|season|career/.test(`${nearBefore} ${nearAfter}`)) role = 'stats';
+    else if (/born|birth|dob/.test(`${nearBefore} ${nearAfter}`)) role = 'birth';
+    else if (/draft/.test(`${nearBefore} ${nearAfter}`)) role = 'draft';
+    else if (/anniversary|retro|throwback|design/.test(`${nearBefore} ${nearAfter}`)) role = 'design';
+    else if (/all rights reserved|printed in|manufactured by/.test(nearAfter)) role = 'copyright';
+    years.push({ year, role, context: cleanLong(ctx.replace(/\s+/g,' '), 150) });
+  }
+  return years.slice(0, 20);
 }
 
-function escapeRegex(s) { return String(s || '').replace(/[.*+?^${}()|[\]\\]/g, '\\$&'); }
+function provisionalFromGoogle(g) {
+  const ocr = allGoogleText(g);
+  const web = allGoogleWebText(g);
+  const candidates = extractCardCandidates(`${g?.back?.fullText || ''}\n${g?.front?.fullText || ''}`);
+  const webCandidates = extractCardCandidates(web);
+  const cardNo = candidates[0]?.value || webCandidates[0]?.value || null;
+  const brand = normalizeBrand(detectBrandFromText(`${ocr}\n${web}`));
+  const years = extractYearsWithContext(ocr);
+  const copyrightYears = years.filter(x => x.role === 'copyright').map(x => x.year);
+  const webYears = (web.match(/\b(?:19|20)\d{2}\b/g) || []).map(Number).filter(validYear);
+  const year = copyrightYears.length ? Math.max(...copyrightYears) : null;
+  const bestGuess = [...(g?.front?.web?.bestGuessLabels || []), ...(g?.back?.web?.bestGuessLabels || [])][0] || null;
+  return {
+    year,
+    brand,
+    set: null,
+    subject: null,
+    cardNo,
+    variation: null,
+    team: null,
+    category: null,
+    years,
+    webYears,
+    bestGuess,
+  };
+}
+
+function collectGooglePages(g) {
+  const pages = [];
+  const seen = new Set();
+  for (const [side, r] of [['front',g?.front],['back',g?.back]]) {
+    for (const p of r?.web?.pages || []) {
+      const key = p.url || p.title;
+      if (!key || seen.has(key)) continue;
+      seen.add(key);
+      pages.push({ side, title: p.title, url: p.url, fullMatches: (p.fullMatchingImages || []).length, partialMatches: (p.partialMatchingImages || []).length });
+    }
+  }
+  return pages.slice(0, 20);
+}
+
+async function resolveIdentity(env, google, provisional, webLookup) {
+  const evidence = {
+    frontOCR: cleanLong(google.front?.fullText || '', 6500),
+    backOCR: cleanLong(google.back?.fullText || '', 6500),
+    exactCardCodeCandidates: extractCardCandidates(`${google.back?.fullText || ''}\n${google.front?.fullText || ''}`).slice(0, 8),
+    ocrYearsWithContext: extractYearsWithContext(allGoogleText(google)),
+    googleBestGuess: [...(google.front?.web?.bestGuessLabels || []), ...(google.back?.web?.bestGuessLabels || [])].slice(0, 8),
+    googleEntities: [...(google.front?.web?.entities || []), ...(google.back?.web?.entities || [])].sort((a,b)=>b.score-a.score).slice(0, 15),
+    googleMatchingPages: collectGooglePages(google),
+    googleFullImageMatches: (google.front?.web?.fullMatchingImages || []).length + (google.back?.web?.fullMatchingImages || []).length,
+    provisional,
+    webSearchAnswer: webLookup?.answer || null,
+    webSearchResults: (webLookup?.results || []).slice(0, 12).map(x => ({ title: x.title, url: x.url, content: x.content, score: x.score })),
+  };
+
+  const prompt = `Identify ONE collectible trading card from corroborated evidence. Google OCR and Google Web Detection are primary; live web-search results are independent verification. Return ONLY one valid JSON object.
+
+STRICT RULES:
+- Never invent a field.
+- Exact alphanumeric card codes such as ABC-12, US175, RA-TH are much stronger identifiers than a jersey/uniform number.
+- A statistics season, birth year, draft year, or throwback/design year is NOT the product release year unless independently corroborated.
+- A Google page with a matching image is strong evidence; a full image match is stronger than a visually similar image.
+- Prefer agreement among exact card code + subject + manufacturer + checklist/product page.
+- Use the actual product/set/insert name, not a generic visual description.
+- Do not call something a parallel/variation unless the evidence distinguishes it from base.
+- category must be Sports, TCG, Non-sport, Other, or null.
+- confidence is 0-100 and should exceed 90 only for a strongly corroborated exact card.
+
+EVIDENCE:
+${JSON.stringify(evidence)}
+
+RETURN:
+{"year":number|null,"brand":string|null,"set":string|null,"subject":string|null,"cardNo":string|null,"variation":string|null,"team":string|null,"category":"Sports|TCG|Non-sport|Other|null","confidence":number,"evidence":["short factual reason"],"needs_review":boolean,"review_reason":string|null}`;
+
+  const raw = await env.AI.run(TEXT_MODEL, {
+    messages: [
+      { role: 'system', content: 'You are a conservative trading-card identity resolver. Use only supplied evidence. Return one JSON object only.' },
+      { role: 'user', content: prompt },
+    ],
+    response_format: { type: 'json_object' },
+    temperature: 0.01,
+    max_tokens: 1200,
+    stream: false,
+  });
+  const obj = structuredModelResult(raw, 'identity resolver');
+  return normalizeIdentityResult(obj);
+}
+
+function normalizeIdentityResult(obj) {
+  const category = ['Sports','TCG','Non-sport','Other'].includes(obj?.category) ? obj.category : null;
+  const year = validYear(obj?.year);
+  const identity = {
+    year,
+    brand: normalizeBrand(obj?.brand),
+    set: clean(obj?.set),
+    subject: clean(obj?.subject),
+    cardNo: clean(obj?.cardNo)?.replace(/^#/, '') || null,
+    variation: clean(obj?.variation),
+    team: clean(obj?.team),
+    category: category || 'Other',
+  };
+  return {
+    identity,
+    identity_confidence: clamp(Math.round(Number(obj?.confidence) || 0), 0, 100),
+    evidence: Array.isArray(obj?.evidence) ? obj.evidence.map(clean).filter(Boolean).slice(0, 12) : [],
+    needs_review: obj?.needs_review !== undefined ? Boolean(obj.needs_review) : true,
+    review_reason: clean(obj?.review_reason),
+  };
+}
+
+function deterministicIdentityFallback(google, provisional, webLookup) {
+  const text = `${allGoogleText(google)}\n${allGoogleWebText(google)}\n${(webLookup?.results || []).map(x=>`${x.title} ${x.content}`).join('\n')}`;
+  const cardCandidates = extractCardCandidates(`${google.back?.fullText || ''}\n${google.front?.fullText || ''}`);
+  const cardNo = cardCandidates[0]?.value || provisional.cardNo || null;
+  const brand = normalizeBrand(provisional.brand || detectBrandFromText(text));
+  const pages = collectGooglePages(google);
+  const bestTitle = pages.find(x => cardNo && String(x.title || '').toUpperCase().includes(cardNo))?.title || pages[0]?.title || null;
+  const subject = extractSubjectFromTitle(bestTitle, cardNo, brand);
+  const years = (String(bestTitle || '').match(/\b(?:19|20)\d{2}\b/g) || []).map(Number).filter(validYear);
+  const year = years[0] || provisional.year || null;
+  return {
+    identity: { year, brand, set: null, subject, cardNo, variation: null, team: null, category: 'Other' },
+    identity_confidence: cardNo && subject ? 70 : cardNo ? 58 : 35,
+    evidence: [bestTitle ? `Google matching page: ${bestTitle}` : null, cardNo ? `OCR card-code candidate: ${cardNo}` : null].filter(Boolean),
+    needs_review: true,
+    review_reason: 'Identity was assembled without the full reconciliation model; review the card details.',
+  };
+}
+
+function guardResolvedIdentity(result, google, webLookup) {
+  const out = normalizeIdentityResult({ ...result.identity, confidence: result.identity_confidence, evidence: result.evidence, needs_review: result.needs_review, review_reason: result.review_reason });
+  const ocr = allGoogleText(google);
+  const webText = `${allGoogleWebText(google)} ${(webLookup?.results || []).map(x=>`${x.title} ${x.content}`).join(' ')}`;
+  const exactCandidates = extractCardCandidates(`${google.back?.fullText || ''}\n${google.front?.fullText || ''}`);
+  const strongCode = exactCandidates[0]?.score >= 100 ? exactCandidates[0].value : null;
+
+  if (strongCode) {
+    if (out.identity.cardNo && normalizeToken(out.identity.cardNo) !== normalizeToken(strongCode)) {
+      out.needs_review = true;
+      out.review_reason = cleanJoin(out.review_reason, `OCR strongly supports card code ${strongCode}; conflicting card-number output was replaced.`);
+    }
+    out.identity.cardNo = strongCode;
+  }
+  const brand = detectBrandFromText(`${ocr}\n${webText}`);
+  if (brand) out.identity.brand = normalizeBrand(brand);
+
+  // Guard against the most common card-back year error: statistics, birth,
+  // draft, anniversary/design years must not displace a separately corroborated
+  // copyright/product year.
+  const yr = Number(out.identity.year);
+  if (yr) {
+    const allYearContexts = extractYearsWithContext(ocr);
+    const contexts = allYearContexts.filter(x => x.year === yr);
+    const nonProductRoles = new Set(['stats','birth','draft','design']);
+    const onlyNonProduct = contexts.length && contexts.every(x => nonProductRoles.has(x.role));
+    const webHasYear = new RegExp(`\\b${yr}\\b`).test(webText);
+    const copyrightYears = [...new Set(allYearContexts.filter(x => x.role === 'copyright').map(x => x.year))].sort((a,b)=>b-a);
+    const corroboratedCopyright = copyrightYears.find(y => new RegExp(`\\b${y}\\b`).test(webText));
+    if (onlyNonProduct && corroboratedCopyright && corroboratedCopyright !== yr) {
+      out.identity.year = corroboratedCopyright;
+      out.identity_confidence = Math.min(Math.max(out.identity_confidence, 82), 94);
+      out.needs_review = true;
+      out.review_reason = cleanJoin(out.review_reason, `${yr} appears only in non-product context; corroborated copyright/web evidence supports ${corroboratedCopyright}.`);
+    } else if (onlyNonProduct && !webHasYear) {
+      out.identity.year = null;
+      out.identity_confidence = Math.min(out.identity_confidence, 72);
+      out.needs_review = true;
+      out.review_reason = cleanJoin(out.review_reason, `${yr} appears only in non-product context and was not used as the product year.`);
+    }
+  }
+
+  // Confidence gets a deterministic boost only when independent evidence agrees.
+  const combined = `${ocr}\n${webText}`.toLowerCase();
+  let support = 0;
+  if (out.identity.cardNo && combined.includes(String(out.identity.cardNo).toLowerCase())) support += 2;
+  if (out.identity.subject && combined.includes(String(out.identity.subject).toLowerCase())) support += 2;
+  if (out.identity.brand && combined.includes(String(out.identity.brand).toLowerCase())) support += 1;
+  if (out.identity.year && combined.includes(String(out.identity.year))) support += 1;
+  if (collectGooglePages(google).length) support += 1;
+  if ((google.front?.web?.fullMatchingImages || []).length + (google.back?.web?.fullMatchingImages || []).length) support += 2;
+  if ((webLookup?.results || []).length) support += 1;
+  const floor = support >= 8 ? 94 : support >= 6 ? 88 : support >= 4 ? 78 : 0;
+  out.identity_confidence = Math.max(out.identity_confidence, floor);
+
+  const complete = Boolean(out.identity.year && out.identity.brand && out.identity.set && out.identity.subject && out.identity.cardNo);
+  if (complete && out.identity_confidence >= 85) {
+    out.needs_review = false;
+    out.review_reason = null;
+  } else if (!out.review_reason) {
+    out.needs_review = true;
+    out.review_reason = 'Some exact identity fields remain weakly corroborated.';
+  }
+  out.evidence = Array.from(new Set([
+    ...(out.evidence || []),
+    strongCode ? `Google OCR read card code ${strongCode}.` : null,
+    collectGooglePages(google).length ? 'Google Web Detection found matching webpages/images.' : null,
+    webLookup?.used ? 'Independent web search was used to corroborate the identity.' : null,
+  ].filter(Boolean))).slice(0, 12);
+  return out;
+}
+
+function extractSubjectFromTitle(title, cardNo, brand) {
+  let t = clean(title);
+  if (!t) return null;
+  t = t.replace(/<[^>]+>/g, ' ').replace(/&[^;]+;/g, ' ');
+  if (cardNo) t = t.replace(new RegExp(`#?${escapeRegex(cardNo)}`, 'ig'), ' ');
+  if (brand) t = t.replace(new RegExp(`\\b${escapeRegex(brand)}\\b`, 'ig'), ' ');
+  t = t.replace(/\b(?:19|20)\d{2}\b/g, ' ').replace(/\b(?:trading|sports?)\s+cards?\b/ig, ' ').replace(/\bcard\b/ig, ' ');
+  t = t.replace(/\s*[|–—:-]\s*(?:eBay|Beckett|PSA|TCDB|Trading Card Database).*$/i, ' ').replace(/\s+/g, ' ').trim();
+  // Fallback extraction is intentionally conservative; long product titles are not names.
+  if (t.split(' ').length >= 2 && t.split(' ').length <= 5 && t.length <= 60) return t;
+  return null;
+}
+
+async function inspectConditionSide(env, side, image) {
+  const question = `Inspect ONLY the visible physical condition of the ${side} of one raw trading card. Do not identify the card and do not estimate centering.
+
+Return SIMPLE KEY=VALUE lines, no markdown. If a category cannot be judged reliably from this single photo, use UNKNOWN rather than guessing.
+
+Scores are 1-10 in 0.5 increments:
+- 10 = no visible defect at this photo's resolution
+- 9-9.5 = minute visible issue
+- 8-8.5 = minor visible issue
+- 7-7.5 = clearly visible moderate issue
+- below 7 requires a clearly visible named defect; otherwise UNKNOWN
+
+Use exactly:
+CORNERS=
+EDGES=
+SURFACE=
+FOCUS=
+DEFECTS=
+CONFIDENCE=
+NOTES=
+
+DEFECTS: comma-separated only from crease,dent,stain,scratch,printline,mark,possible_alteration, or NONE.
+FOCUS is print/focus/registration quality visible on the card, not camera sharpness.
+CONFIDENCE is 0-100 for how reliably this photo supports the condition scores.
+NOTES must briefly name visible evidence for any score below 9.`;
+
+  try {
+    const raw = await env.AI.run(CONDITION_MODEL, {
+      task: 'query', image, question, reasoning: false, temperature: 0, max_tokens: 900, stream: false,
+    });
+    return parseConditionKV(modelText(raw), side);
+  } catch (e) {
+    return unknownConditionSide(side, `Condition model unavailable: ${cleanError(e)}`);
+  }
+}
+
+function parseConditionKV(text, side) {
+  const vals = {};
+  for (const rawLine of String(text || '').split(/\r?\n/)) {
+    const m = rawLine.trim().replace(/^[-*]\s*/, '').match(/^([A-Z_]+)\s*[:=]\s*(.*)$/i);
+    if (m) vals[m[1].toUpperCase()] = m[2].trim();
+  }
+  const value = k => {
+    const v = vals[k];
+    if (!v || /^(unknown|null|n\/a)$/i.test(v)) return null;
+    return v;
+  };
+  const score = k => {
+    const m = String(value(k) || '').match(/\d+(?:\.\d+)?/);
+    if (!m) return null;
+    const n = Number(m[0]);
+    return n >= 1 && n <= 10 ? clampHalf(n,1,10) : null;
+  };
+  const defectText = String(value('DEFECTS') || '').toLowerCase();
+  const has = k => defectText && !/\bnone\b/.test(defectText) && new RegExp(`\\b${k.replace('_','[_ -]?')}\\b`,'i').test(defectText);
+  const out = {
+    side,
+    corners: score('CORNERS'), edges: score('EDGES'), surface: score('SURFACE'), focus: score('FOCUS'),
+    defects: { crease:has('crease'), dent:has('dent'), stain:has('stain'), scratch:has('scratch'), printline:has('printline'), mark:has('mark'), possible_alteration:has('possible_alteration') },
+    confidence: clamp(Math.round(Number(String(value('CONFIDENCE')||'').match(/\d+(?:\.\d+)?/)?.[0]) || 0), 0, 100),
+    notes: String(value('NOTES') || '').split(/\s*;\s*|\s*\|\s*/).map(clean).filter(Boolean).slice(0, 6),
+  };
+  const scored = ['corners','edges','surface','focus'].map(k=>out[k]).filter(Number.isFinite);
+  const anyDefect = Object.values(out.defects).some(Boolean);
+  // Reject common malformed/placeholder output rather than contaminating a grade.
+  if (scored.length === 4 && scored.every(v=>v===1) && !anyDefect) {
+    out.corners=out.edges=out.surface=out.focus=null;
+    out.confidence=Math.min(out.confidence||30,30);
+    out.notes.push('Condition scores withheld because the model output was internally inconsistent.');
+  }
+  for (const k of ['corners','edges','surface','focus']) {
+    if (Number.isFinite(out[k]) && out[k] < 7 && !anyDefect && !out.notes.length) out[k] = null;
+  }
+  return out;
+}
+
+function unknownConditionSide(side, note) {
+  return { side, corners:null, edges:null, surface:null, focus:null, defects:{crease:false,dent:false,stain:false,scratch:false,printline:false,mark:false,possible_alteration:false}, confidence:0, notes:[note] };
+}
+
+function combineCondition(front, back) {
+  const worse = k => {
+    const vals = [front?.[k], back?.[k]].map(Number).filter(Number.isFinite);
+    return vals.length === 2 ? clampHalf(Math.min(...vals),1,10) : null;
+  };
+  const defects = {};
+  for (const k of ['crease','dent','stain','scratch','printline','mark','possible_alteration']) defects[k] = Boolean(front?.defects?.[k] || back?.defects?.[k]);
+  const confs = [front?.confidence,back?.confidence].map(Number).filter(Number.isFinite);
+  let confidence = confs.length === 2 ? Math.round((confs[0]+confs[1])/2) : 0;
+  const scores = ['corners','edges','surface','focus'].map(worse);
+  if (scores.some(v=>!Number.isFinite(v))) confidence = Math.min(confidence, 40);
+  return {
+    corners:worse('corners'), edges:worse('edges'), surface:worse('surface'), focus:worse('focus'),
+    defects,
+    confidence: clamp(confidence,0,95),
+    notes: Array.from(new Set([...(front?.notes||[]).map(x=>`Front: ${x}`), ...(back?.notes||[]).map(x=>`Back: ${x}`), 'Condition combines the worse visible front/back result; microscopic or hidden defects cannot be ruled out from phone photos.'])).slice(0,10),
+    sides: { front, back },
+  };
+}
+
+async function tavilyCardLookup(env, provisional, google) {
+  const queries = buildLookupQueries(provisional, google);
+  if (!queries.length) return { configured:true, used:false, query:'', queries:[], results:[], answer:null };
+  const batches = await Promise.all(queries.slice(0, 3).map(q => tavilySearch(env, q, 8)));
+  const byUrl = new Map();
+  for (const b of batches) for (const x of b.results || []) {
+    const key = x.url || `${x.title}|${x.content}`;
+    if (!byUrl.has(key) || (byUrl.get(key).score || 0) < (x.score || 0)) byUrl.set(key,x);
+  }
+  return { configured:true, used:true, query:queries[0], queries, answer:batches.map(x=>x.answer).filter(Boolean).join(' | ')||null, results:[...byUrl.values()].sort((a,b)=>(b.score||0)-(a.score||0)).slice(0,14) };
+}
+
+function buildLookupQueries(i = {}, google) {
+  const code = i.cardNo || extractCardCandidates(allGoogleText(google))[0]?.value || '';
+  const brand = i.brand || normalizeBrand(detectBrandFromText(`${allGoogleText(google)} ${allGoogleWebText(google)}`)) || '';
+  const bestGuess = i.bestGuess || '';
+  const pages = collectGooglePages(google);
+  const title = pages[0]?.title || '';
+  const q=[];
+  if (code) {
+    q.push([`"${code}"`, brand, 'trading card checklist'].filter(Boolean).join(' '));
+    q.push([`"${code}"`, 'Topps Panini Bowman Beckett TCDB trading card'].filter(Boolean).join(' '));
+  }
+  if (title) q.push(`${title} trading card checklist`);
+  else if (bestGuess) q.push(`${bestGuess} ${brand} trading card checklist`);
+  if (!q.length) {
+    const ocr = allGoogleText(google).replace(/\s+/g,' ').slice(0,220);
+    if (ocr) q.push(`${ocr} trading card identify`);
+  }
+  return [...new Set(q.map(x=>x.replace(/\s+/g,' ').trim()).filter(Boolean))];
+}
+
+async function tavilySearch(env, query, maxResults = 8, includeDomains = null) {
+  const body = { query, topic:'general', search_depth:'basic', max_results:maxResults, include_answer:true, include_raw_content:false, include_images:false };
+  if (includeDomains?.length) body.include_domains = includeDomains;
+  const r = await fetch('https://api.tavily.com/search', {
+    method:'POST',
+    headers:{ 'Authorization':`Bearer ${env.TAVILY_API_KEY}`, 'Content-Type':'application/json', 'Accept':'application/json' },
+    body:JSON.stringify(body),
+  });
+  if (!r.ok) {
+    const t = await r.text().catch(()=> '');
+    throw new Error(`Tavily search ${r.status}${t?`: ${t.slice(0,180)}`:''}`);
+  }
+  const j = await r.json();
+  return { answer:clean(j.answer), results:(j.results||[]).map(x=>({title:clean(x.title),url:cleanLong(x.url,1200),content:cleanLong(x.content,900),score:Number(x.score)||0})) };
+}
+
+async function tavilyEbayLookup(env, identity = {}) {
+  const query = buildQuery(identity);
+  const searchUrl = ebaySearchUrl(query);
+  if (!query) return { configured:true, items:[], query, searchUrl, source:'Tavily web-indexed eBay results' };
+  const b = await tavilySearch(env, `${query} current eBay listing`, 10, ['ebay.com']);
+  const items = (b.results||[]).slice(0,8).map(x=>({ title:x.title, url:x.url, price:extractPrice(`${x.title||''} ${x.content||''}`), content:x.content }));
+  return { configured:true, items, query, searchUrl, source:'Tavily web-indexed eBay results' };
+}
+
+function extractPrice(text) {
+  const m=String(text||'').match(/\$\s*([0-9]{1,6}(?:,[0-9]{3})*(?:\.\d{2})?)/);
+  return m?Number(m[1].replace(/,/g,'')):null;
+}
+
+function buildQuery(i={}) {
+  return [i.year,i.brand,i.set,i.subject,i.cardNo,i.variation].filter(Boolean).join(' ').replace(/\s+/g,' ').trim();
+}
+function ebaySearchUrl(query) { return query ? `https://www.ebay.com/sch/i.html?_nkw=${encodeURIComponent(query)}` : 'https://www.ebay.com/'; }
 
 async function ebaySearch(env, query) {
-  if (!query) return { configured: true, items: [], query };
+  if (!query) return { configured:true, items:[], query };
   const token = await getEbayToken(env);
   const url = new URL('https://api.ebay.com/buy/browse/v1/item_summary/search');
-  url.searchParams.set('q', query);
-  url.searchParams.set('limit', '12');
-  const r = await fetch(url, {
-    headers: { 'Authorization': `Bearer ${token}`, 'X-EBAY-C-MARKETPLACE-ID': 'EBAY_US', 'Accept': 'application/json' },
-  });
+  url.searchParams.set('q',query); url.searchParams.set('limit','12');
+  const r = await fetch(url, { headers:{ 'Authorization':`Bearer ${token}`, 'X-EBAY-C-MARKETPLACE-ID':'EBAY_US', 'Accept':'application/json' } });
   if (!r.ok) throw new Error(`eBay Browse API ${r.status}`);
-  const data = await r.json();
-  const items = (data.itemSummaries || []).slice(0, 12).map(x => ({
-    itemId: x.itemId, title: x.title, price: x.price?.value ? Number(x.price.value) : null,
-    currency: x.price?.currency || 'USD', image: x.image?.imageUrl || null, url: x.itemWebUrl || null,
-    condition: x.condition || null,
-  }));
-  return { configured: true, items, query };
+  const data=await r.json();
+  const items=(data.itemSummaries||[]).slice(0,12).map(x=>({ itemId:x.itemId,title:x.title,price:x.price?.value?Number(x.price.value):null,currency:x.price?.currency||'USD',image:x.image?.imageUrl||null,url:x.itemWebUrl||null,condition:x.condition||null }));
+  return { configured:true,items,query };
 }
 
 async function getEbayToken(env) {
-  if (ebayTokenCache.token && ebayTokenCache.expiresAt > Date.now() + 60000) return ebayTokenCache.token;
-  const basic = btoa(`${env.EBAY_CLIENT_ID}:${env.EBAY_CLIENT_SECRET}`);
-  const r = await fetch('https://api.ebay.com/identity/v1/oauth2/token', {
-    method: 'POST',
-    headers: { 'Authorization': `Basic ${basic}`, 'Content-Type': 'application/x-www-form-urlencoded' },
-    body: 'grant_type=client_credentials&scope=https%3A%2F%2Fapi.ebay.com%2Foauth%2Fapi_scope',
-  });
-  if (!r.ok) throw new Error(`eBay OAuth ${r.status}`);
-  const j = await r.json();
-  ebayTokenCache = { token: j.access_token, expiresAt: Date.now() + (Number(j.expires_in || 7200) * 1000) };
-  return ebayTokenCache.token;
+  if (ebayTokenCache.token && ebayTokenCache.expiresAt > Date.now()+60000) return ebayTokenCache.token;
+  const basic=btoa(`${env.EBAY_CLIENT_ID}:${env.EBAY_CLIENT_SECRET}`);
+  const r=await fetch('https://api.ebay.com/identity/v1/oauth2/token',{method:'POST',headers:{'Authorization':`Basic ${basic}`,'Content-Type':'application/x-www-form-urlencoded'},body:'grant_type=client_credentials&scope=https%3A%2F%2Fapi.ebay.com%2Foauth%2Fapi_scope'});
+  if(!r.ok) throw new Error(`eBay OAuth ${r.status}`);
+  const j=await r.json(); ebayTokenCache={token:j.access_token,expiresAt:Date.now()+Number(j.expires_in||7200)*1000}; return ebayTokenCache.token;
 }
 
-function normalizePair(p) {
-  let a = Number(p[0]), b = Number(p[1]);
-  const total = a + b;
-  if (!(total > 0)) return [50, 50];
-  a = a / total * 100; b = 100 - a;
-  return a >= b ? [round1(a), round1(b)] : [round1(b), round1(a)];
+function structuredModelResult(raw,label) {
+  if(!raw) throw new Error(`${label} returned no result.`);
+  if(raw.response && typeof raw.response==='object' && !Array.isArray(raw.response)) return raw.response;
+  if(raw.result && typeof raw.result==='object' && !Array.isArray(raw.result)) return raw.result;
+  const msg=raw.choices?.[0]?.message;
+  if(msg?.parsed && typeof msg.parsed==='object') return msg.parsed;
+  if(typeof msg?.content==='string') return parseModelJSON(msg.content,label);
+  if(typeof raw.response==='string') return parseModelJSON(raw.response,label);
+  if(typeof raw.answer==='string') return parseModelJSON(raw.answer,label);
+  return parseModelJSON(modelText(raw),label);
 }
-function clampHalf(v, min, max) { return Math.round(clamp(v, min, max) * 2) / 2; }
-function clamp(v, min, max) { return Math.max(min, Math.min(max, v)); }
-function round1(v) { return Math.round(v * 10) / 10; }
-function clean(v) { return v == null ? null : String(v).trim().slice(0, 300) || null; }
-function cleanError(e) { return String(e?.message || e || 'Unknown error').slice(0, 500); }
+function modelText(raw) {
+  if(typeof raw==='string') return raw;
+  if(!raw) return '';
+  if(typeof raw.answer==='string') return raw.answer;
+  if(typeof raw.response==='string') return raw.response;
+  if(typeof raw.result==='string') return raw.result;
+  const c=raw.choices?.[0]?.message?.content;
+  if(typeof c==='string') return c;
+  if(Array.isArray(c)) return c.map(x=>x?.text||'').join('\n');
+  return JSON.stringify(raw);
+}
+function parseModelJSON(text,label) {
+  if(typeof text!=='string') throw new Error(`${label} returned no text.`);
+  const cleaned=text.trim().replace(/^```(?:json)?\s*/i,'').replace(/\s*```$/i,'');
+  try{return JSON.parse(cleaned)}catch{}
+  const start=cleaned.indexOf('{'),end=cleaned.lastIndexOf('}');
+  if(start>=0&&end>start){try{return JSON.parse(cleaned.slice(start,end+1))}catch{}}
+  throw new Error(`${label} returned an unreadable response.`);
+}
+
+function normalizeBrand(value) {
+  const raw=clean(value); if(!raw)return null;
+  const brands=['Topps','Panini','Bowman','Upper Deck','Fleer','Donruss','Score','Leaf','O-Pee-Chee','SkyBox','Pacific'];
+  const n=normalizeToken(raw);
+  for(const b of brands){const bn=normalizeToken(b);if(n===bn)return b;if(Math.abs(n.length-bn.length)<=1&&levenshtein(n,bn)<=2)return b}
+  return raw;
+}
+function normalizeToken(s){return String(s||'').toLowerCase().replace(/[^a-z0-9]/g,'').replace(/0/g,'o').replace(/5/g,'s')}
+function levenshtein(a,b){const m=Array.from({length:b.length+1},(_,i)=>i);for(let i=1;i<=a.length;i++){let prev=m[0];m[0]=i;for(let j=1;j<=b.length;j++){const tmp=m[j];m[j]=Math.min(m[j]+1,m[j-1]+1,prev+(a[i-1]===b[j-1]?0:1));prev=tmp}}return m[b.length]}
+function validYear(v){const n=Number(v);return Number.isInteger(n)&&n>=1880&&n<=2100?n:null}
+function clampHalf(v,min,max){return Math.round(clamp(v,min,max)*2)/2}
+function clamp(v,min,max){return Math.max(min,Math.min(max,v))}
+function clean(v){return v==null?null:String(v).trim().slice(0,300)||null}
+function cleanLong(v,max=3000){return v==null?null:String(v).trim().slice(0,max)||null}
+function cleanJoin(a,b){return [clean(a),clean(b)].filter(Boolean).join(' ')}
+function cleanError(e){return String(e?.message||e||'Unknown error').slice(0,600)}
+function escapeRegex(s){return String(s||'').replace(/[.*+?^${}()|[\]\\]/g,'\\$&')}
