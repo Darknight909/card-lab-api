@@ -1,7 +1,7 @@
-const VERSION = '1.4.1';
+const VERSION = '1.4.2';
 const DEFAULT_ORIGIN = 'https://darknight909.github.io';
 const VISION_MODEL = '@cf/google/gemma-4-26b-a4b-it';
-const TEXT_MODEL = '@cf/google/gemma-4-26b-a4b-it';
+const TEXT_MODEL = '@cf/meta/llama-3.3-70b-instruct-fp8-fast';
 
 let ebayTokenCache = { token: null, expiresAt: 0 };
 
@@ -143,60 +143,173 @@ function validateImage(value, label) {
 }
 
 async function inspectSide(env, side, image) {
-  const question = `You are inspecting the ${side} of ONE raw collectible trading card from a phone photo. Return ONLY valid JSON, no markdown.
+  const question = `Inspect the ${side} of ONE raw collectible trading card from the photo.
 
-Do not invent text. Read visible text carefully. The card can be sports, TCG, or non-sport.
-IMPORTANT YEAR RULE: distinguish the product/release year from statistics years, season years, copyright years, birth years, draft years, anniversary references, and historical design years. A statistics heading such as "2025 RECEIVING STATS" is NOT automatically the card's release year. If a copyright/product year is explicit, label its role. If release year cannot be established from this side alone, use null.
-IMPORTANT CARD NUMBER RULE: card/set codes such as 91TF-2, US175, RA-TH, #123 are high-value identity clues. Copy exactly when legible. Do NOT treat a large uniform/jersey number, stat total, serial on equipment, or player number as the card number unless the card explicitly labels it as the card number.
-For set/insert/parallel, only state an exact value if it is visible or strongly supported by the design/card code; otherwise use null and put clues in set_clues.
-${side === 'back' ? `BACK-SIDE IDENTITY PRIORITY: read the top/upper card code, player/team line, manufacturer logo near the bottom, and the tiny copyright/legal line at the bottom. If the legal line gives a copyright year, record it in years_seen with role "copyright". A heading such as "2025 RECEIVING STATS" must be role "stats", never release. Stylized Topps logos must be returned as brand "Topps", not OCR-like variants.` : ''}
+Return SIMPLE KEY=VALUE lines, one field per line. Do NOT return JSON or markdown.
+If a value cannot be determined, use UNKNOWN. Do not invent text.
 
-For condition, estimate only defects visible in THIS photo. Be conservative. A missing defect means "not visible", not proof it is absent. Surface defects are hard to assess under glare.
-Centering should be a best visual estimate as percentages with the larger side first, for left/right and top/bottom, or null for borderless/uncertain designs.
+YEAR RULE: a stats season (example: 2025 RECEIVING STATS), birth year, draft year, copyright year, anniversary year, or throwback design year is NOT automatically the product release year.
+CARD NUMBER RULE: codes such as 91TF-2, US175, RA-TH, #123 are strong identity clues. Do NOT use a jersey/uniform number as the card number.
+${side === 'back' ? 'BACK PRIORITY: read the card code near the top, player/team line, manufacturer logo, copyright/legal line, and any set/insert wording.' : 'FRONT PRIORITY: read player/subject, team, manufacturer/logo, anniversary/set clues, and any card code.'}
+Condition scores are 1-10 in 0.5 increments and must reflect only what is actually visible in this photo.
+Centering is larger-side-first percentages, e.g. 55/45. Use UNKNOWN when borderless or unreliable.
 
-JSON schema:
-{
-  "side":"${side}",
-  "visible_text":["..."],
-  "identity":{
-    "subject":string|null,
-    "team_or_affiliation":string|null,
-    "brand":string|null,
-    "exact_set_or_insert":string|null,
-    "set_clues":["..."],
-    "card_number":string|null,
-    "variation_or_parallel":string|null,
-    "release_year":number|null,
-    "years_seen":[{"year":number,"role":"stats|copyright|release|design|birth|draft|unknown"}],
-    "category":"Sports|TCG|Non-sport|Other|null"
-  },
-  "condition":{
-    "corners":number,
-    "edges":number,
-    "surface":number,
-    "focus_registration":number,
-    "centering_lr":[number,number]|null,
-    "centering_tb":[number,number]|null,
-    "defects":{"crease":boolean,"dent":boolean,"stain":boolean,"scratch":boolean,"printline":boolean,"mark":boolean,"possible_alteration":boolean},
-    "notes":["..."],
-    "photo_confidence":number
-  }
-}
-Scores are 1-10 in 0.5 increments. photo_confidence is 0-100.`;
+Use exactly these keys:
+SIDE=${side}
+SUBJECT=
+TEAM=
+BRAND=
+SET=
+SET_CLUES=
+CARD_NUMBER=
+VARIATION=
+RELEASE_YEAR=
+YEARS_SEEN=
+CATEGORY=
+CORNERS=
+EDGES=
+SURFACE=
+FOCUS=
+CENTERING_LR=
+CENTERING_TB=
+DEFECTS=
+CONFIDENCE=
+VISIBLE_TEXT=
+NOTES=
+
+YEARS_SEEN format example: 2025:stats;2026:copyright
+DEFECTS: comma-separated from crease,dent,stain,scratch,printline,mark,possible_alteration, or NONE.
+CATEGORY: Sports, TCG, Non-sport, or Other.
+VISIBLE_TEXT: semicolon-separated exact snippets you can read.`;
 
   const raw = await env.AI.run(VISION_MODEL, {
     messages: [
-      { role: 'system', content: 'You are a precise trading-card OCR and condition-inspection engine. Return one valid JSON object only. Never invent text.' },
+      { role: 'system', content: 'You are a precise trading-card OCR and condition-inspection engine. Follow the requested KEY=VALUE format. Never invent text.' },
       { role: 'user', content: question },
     ],
     image,
     chat_template_kwargs: { enable_thinking: false },
     temperature: 0.02,
-    max_tokens: 2200,
+    max_tokens: 1600,
     stream: false,
   });
+
   const text = modelText(raw);
-  return parseModelJSON(text, `${side} vision`);
+  // Accept JSON too if the model happens to emit it, but do not depend on JSON.
+  try {
+    const parsed = parseModelJSON(text, `${side} vision`);
+    if (parsed && typeof parsed === 'object' && parsed.identity && parsed.condition) return parsed;
+  } catch {}
+
+  const kv = parseVisionKV(text, side);
+  if (visionReadHasUsefulClues(kv)) return kv;
+
+  // Last-resort OCR pass: plain transcription is easier for a vision model than
+  // structured output. It still gives the web verifier card codes/names to search.
+  const ocrRaw = await env.AI.run(VISION_MODEL, {
+    messages: [
+      { role: 'system', content: 'Transcribe visible trading-card text accurately. Do not explain.' },
+      { role: 'user', content: `Transcribe every legible word, number, card code, logo/brand name, player name, team name, and copyright line from the ${side} of this card. Plain text only.` },
+    ],
+    image,
+    chat_template_kwargs: { enable_thinking: false },
+    temperature: 0,
+    max_tokens: 1200,
+    stream: false,
+  });
+  const transcript = modelText(ocrRaw).trim();
+  return fallbackVisionRead(transcript || text, side);
+}
+
+function visionReadHasUsefulClues(r) {
+  if (!r) return false;
+  const i = r.identity || {};
+  const c = r.condition || {};
+  return Boolean(i.subject || i.card_number || i.brand || (r.visible_text || []).length || Number.isFinite(Number(c.photo_confidence)));
+}
+
+function parseVisionKV(text, side) {
+  const values = {};
+  for (const rawLine of String(text || '').split(/\r?\n/)) {
+    const line = rawLine.trim().replace(/^[-*]\s*/, '');
+    const m = line.match(/^([A-Z_]+)\s*[:=]\s*(.*)$/i);
+    if (!m) continue;
+    values[m[1].toUpperCase()] = m[2].trim();
+  }
+  const val = k => {
+    const v = values[k];
+    if (!v || /^(unknown|null|n\/a|none)$/i.test(v.trim())) return null;
+    return v.trim();
+  };
+  const num = k => {
+    const m = String(val(k) || '').match(/-?\d+(?:\.\d+)?/);
+    return m ? Number(m[0]) : null;
+  };
+  const pair = k => parsePercentPair(val(k));
+  const years = [];
+  for (const part of String(val('YEARS_SEEN') || '').split(/[;|,]+/)) {
+    const m = part.trim().match(/\b((?:19|20)\d{2})\b\s*[:=\-]?\s*([A-Za-z_ -]+)?/);
+    if (!m) continue;
+    let role = String(m[2] || 'unknown').trim().toLowerCase().replace(/\s+/g, '_');
+    const allowed = ['stats','copyright','release','design','birth','draft','unknown'];
+    if (!allowed.includes(role)) role = 'unknown';
+    years.push({ year: Number(m[1]), role });
+  }
+  const releaseYear = num('RELEASE_YEAR');
+  const defectsText = String(val('DEFECTS') || '').toLowerCase();
+  const defect = name => defectsText && !/\bnone\b/.test(defectsText) && new RegExp(`\\b${name}\\b`, 'i').test(defectsText);
+  const visible = String(val('VISIBLE_TEXT') || '').split(/\s*;\s*/).map(x=>x.trim()).filter(Boolean).slice(0,30);
+  const setClues = String(val('SET_CLUES') || '').split(/\s*;\s*|\s*\|\s*/).map(x=>x.trim()).filter(Boolean).slice(0,12);
+  const categoryRaw = val('CATEGORY');
+  const category = ['Sports','TCG','Non-sport','Other'].find(x => categoryRaw && x.toLowerCase() === categoryRaw.toLowerCase()) || null;
+  return {
+    side,
+    visible_text: visible,
+    identity: {
+      subject: val('SUBJECT'),
+      team_or_affiliation: val('TEAM'),
+      brand: normalizeBrand(val('BRAND')),
+      exact_set_or_insert: val('SET'),
+      set_clues: setClues,
+      card_number: val('CARD_NUMBER'),
+      variation_or_parallel: val('VARIATION'),
+      release_year: validYear(releaseYear),
+      years_seen: years,
+      category,
+    },
+    condition: {
+      corners: num('CORNERS'), edges: num('EDGES'), surface: num('SURFACE'), focus_registration: num('FOCUS'),
+      centering_lr: pair('CENTERING_LR'), centering_tb: pair('CENTERING_TB'),
+      defects: {
+        crease: defect('crease'), dent: defect('dent'), stain: defect('stain'), scratch: defect('scratch'),
+        printline: defect('printline'), mark: defect('mark'), possible_alteration: /possible[_ -]?alteration/i.test(defectsText),
+      },
+      notes: String(val('NOTES') || '').split(/\s*;\s*/).map(x=>x.trim()).filter(Boolean).slice(0,8),
+      photo_confidence: num('CONFIDENCE'),
+    },
+  };
+}
+
+function parsePercentPair(v) {
+  if (!v) return null;
+  const m = String(v).match(/(\d{1,3}(?:\.\d+)?)\s*[/:-]\s*(\d{1,3}(?:\.\d+)?)/);
+  if (!m) return null;
+  const a = Number(m[1]), b = Number(m[2]);
+  if (!Number.isFinite(a) || !Number.isFinite(b) || a <= 0 || b <= 0) return null;
+  return normalizePair([a,b]);
+}
+
+function fallbackVisionRead(text, side) {
+  const raw = String(text || '').trim();
+  const code = extractCardCodeFromText(raw);
+  const brand = detectBrandFromText(raw);
+  const visible = raw ? raw.split(/\r?\n|\s*;\s*/).map(x=>x.trim()).filter(Boolean).slice(0,40) : [];
+  return {
+    side,
+    visible_text: visible,
+    identity: { subject:null, team_or_affiliation:null, brand, exact_set_or_insert:null, set_clues:[], card_number:code, variation_or_parallel:null, release_year:null, years_seen:[], category:null },
+    condition: { corners:null, edges:null, surface:null, focus_registration:null, centering_lr:null, centering_tb:null, defects:{crease:false,dent:false,stain:false,scratch:false,printline:false,mark:false,possible_alteration:false}, notes:['Vision response was usable only as OCR text; condition grades were withheld.'], photo_confidence:35 },
+  };
 }
 
 function provisionalIdentity(front, back, marks = null) {
@@ -650,7 +763,8 @@ async function resolveIdentityFromWeb(env, analysis, web, front, back) {
   const prompt = `Identify ONE collectible trading card from visual text clues plus live web search results. Return ONLY valid JSON. Do not use a statistics season as the product release year. Treat an alphanumeric card code (example 91TF-2) as stronger evidence than a jersey number. Prefer exact checklist/manufacturer/database matches across multiple sources. If a field is not supportable, use null.\n\nINPUT:\n${JSON.stringify(clues)}\n\nRETURN:\n{"year":number|null,"brand":string|null,"set":string|null,"subject":string|null,"cardNo":string|null,"variation":string|null,"team":string|null,"category":"Sports|TCG|Non-sport|Other|null","confidence":number,"evidence":["..."]}`;
   const raw = await env.AI.run(TEXT_MODEL, {
     messages:[{role:'system',content:'You identify trading cards from corroborated web evidence. Return one JSON object only.'},{role:'user',content:prompt}],
-    chat_template_kwargs:{enable_thinking:false},temperature:0.02,max_tokens:900,stream:false
+    response_format:{type:'json_object'},
+    temperature:0.02,max_tokens:900,stream:false
   });
   const obj = structuredModelResult(raw, 'web identity');
   const out = structuredClone(analysis);

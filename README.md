@@ -1,6 +1,13 @@
-Card Lab Cloudflare Worker v1.4.1
+Card Lab Cloudflare Worker v1.4.2
 
-Fixes the build-breaking escapeRegex expression in v1.3.0 and preserves the Tavily-assisted hybrid identification workflow.
+Fixes the repeated "front vision returned an unreadable response" failure.
+
+Changes:
+- Gemma 4 vision output no longer has to be valid JSON.
+- Vision uses a simple KEY=VALUE format with a deterministic parser.
+- If structured vision output is weak, a plain-text OCR fallback still feeds card clues to Tavily.
+- Web identity reconciliation uses a Workers AI model that supports JSON mode.
+- Condition/grade fields remain unavailable instead of being invented when the vision pass cannot support them.
 
 Files:
 - worker.js
