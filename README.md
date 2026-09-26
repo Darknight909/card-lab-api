@@ -1,4 +1,4 @@
-Card Lab Cloudflare Worker v1.3.1
+Card Lab Cloudflare Worker v1.4.0
 
 Fixes the build-breaking escapeRegex expression in v1.3.0 and preserves the Tavily-assisted hybrid identification workflow.
 

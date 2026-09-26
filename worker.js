@@ -1,4 +1,4 @@
-const VERSION = '1.3.1';
+const VERSION = '1.4.0';
 const DEFAULT_ORIGIN = 'https://darknight909.github.io';
 const VISION_MODEL = '@cf/moondream/moondream3.1-9B-A2B';
 const TEXT_MODEL = '@cf/meta/llama-3.3-70b-instruct-fp8-fast';
@@ -65,9 +65,11 @@ export default {
       // always comes from the photos, never from web listings.
       const merged = fallbackReconcile(frontRead, backRead);
       const guarded = guardIdentity(merged, frontRead, backRead, null);
-      const analysis = applyWebIdentity(guarded, webLookup, frontRead, backRead);
+      let analysis = applyWebIdentity(guarded, webLookup, frontRead, backRead);
+      try { analysis = await resolveIdentityFromWeb(env, analysis, webLookup, frontRead, backRead); } catch (e) { console.warn('Web identity resolver fallback:', e); }
+      analysis = applyDeterministicIdentity(analysis, frontRead, backRead);
       analysis.identity_confidence = Math.max(analysis.identity_confidence || 0,
-        analysis.web_match?.score >= 18 ? 92 : analysis.identity?.cardNo && analysis.identity?.subject ? 78 : 60);
+        analysis.web_match?.score >= 18 ? 94 : analysis.identity?.cardNo && analysis.identity?.subject && analysis.identity?.year ? 84 : analysis.identity?.cardNo && analysis.identity?.subject ? 76 : 60);
       analysis.condition_confidence = Math.max(analysis.condition_confidence || 0, 60);
       analysis.evidence = Array.from(new Set([
         ...(analysis.evidence || []),
@@ -90,6 +92,12 @@ export default {
         try { ebay = await ebaySearch(env, query); } catch {}
       }
 
+      let market = { configured: Boolean(env.TAVILY_API_KEY), items: [], query, searchUrl: query ? `https://www.ebay.com/sch/i.html?_nkw=${encodeURIComponent(query)}` : 'https://www.ebay.com/' };
+      if (env.TAVILY_API_KEY && query) {
+        try { market = await tavilyEbayLookup(env, analysis.identity || provisional); }
+        catch (e) { market.error = String(e?.message || e); }
+      }
+
       return json({
         ok: true,
         version: VERSION,
@@ -99,8 +107,9 @@ export default {
           query,
           searchUrl: query ? `https://www.ebay.com/sch/i.html?_nkw=${encodeURIComponent(query)}` : 'https://www.ebay.com/',
         },
+        market,
         webLookup: { configured: webLookup.configured, used: webLookup.used, query: webLookup.query, results: (webLookup.results || []).slice(0, 5) },
-        privacy: 'Images were sent to Cloudflare Workers AI for visual analysis. Tavily receives only extracted text clues/search terms, not the card images. This Worker does not save images to KV, R2, D1, or Durable Objects.',
+        privacy: 'Images were sent to Cloudflare Workers AI for visual analysis. Tavily receives only extracted text clues/search terms, not the card images. Tavily is also used to find web-indexed current eBay listings. This Worker does not save images to KV, R2, D1, or Durable Objects.',
       }, 200, cors);
     } catch (e) {
       console.error(e);
@@ -534,53 +543,51 @@ function buildQuery(i = {}) {
 
 
 async function tavilyCardLookup(env, provisional, front, back) {
-  const query = buildLookupQuery(provisional, front, back);
-  if (!query) return { configured: true, used: false, query: '', results: [], answer: null };
+  const queries = buildLookupQueries(provisional, front, back);
+  if (!queries.length) return { configured: true, used: false, query: '', queries: [], results: [], answer: null };
+  const batches = await Promise.all(queries.slice(0, 2).map(q => tavilySearch(env, q, 8)));
+  const byUrl = new Map();
+  for (const b of batches) for (const x of b.results || []) {
+    const key = x.url || `${x.title}|${x.content}`;
+    if (!byUrl.has(key) || (byUrl.get(key).score || 0) < (x.score || 0)) byUrl.set(key, x);
+  }
+  return {
+    configured: true, used: true, query: queries[0], queries,
+    answer: batches.map(x => x.answer).filter(Boolean).join(' | ') || null,
+    results: [...byUrl.values()].sort((a,b)=>(b.score||0)-(a.score||0)).slice(0, 12),
+  };
+}
+
+async function tavilySearch(env, query, maxResults = 8, includeDomains = null) {
+  const body = { query, topic: 'general', search_depth: 'basic', max_results: maxResults, include_answer: true, include_raw_content: false, include_images: false };
+  if (includeDomains?.length) body.include_domains = includeDomains;
   const r = await fetch('https://api.tavily.com/search', {
     method: 'POST',
-    headers: {
-      'Authorization': `Bearer ${env.TAVILY_API_KEY}`,
-      'Content-Type': 'application/json',
-      'Accept': 'application/json',
-    },
-    body: JSON.stringify({
-      query,
-      topic: 'general',
-      search_depth: 'basic',
-      max_results: 8,
-      include_answer: true,
-      include_raw_content: false,
-      include_images: false,
-    }),
+    headers: { 'Authorization': `Bearer ${env.TAVILY_API_KEY}`, 'Content-Type': 'application/json', 'Accept': 'application/json' },
+    body: JSON.stringify(body),
   });
   if (!r.ok) {
     const t = await r.text().catch(() => '');
     throw new Error(`Tavily search ${r.status}${t ? `: ${t.slice(0, 180)}` : ''}`);
   }
   const j = await r.json();
-  return {
-    configured: true, used: true, query, answer: clean(j.answer),
-    results: (j.results || []).slice(0, 8).map(x => ({
-      title: clean(x.title), url: clean(x.url), content: clean(x.content), score: Number(x.score) || 0,
-    })),
-  };
+  return { answer: clean(j.answer), results: (j.results || []).map(x => ({ title: clean(x.title), url: clean(x.url), content: clean(x.content), score: Number(x.score) || 0 })) };
 }
 
-function buildLookupQuery(i = {}, front, back) {
-  const text = allReadText(front, back).join(' ');
-  const clues = [];
-  if (i.cardNo) clues.push(`"${i.cardNo}"`);
-  if (i.subject) clues.push(`"${i.subject}"`);
-  if (i.brand) clues.push(i.brand);
-  if (i.set) clues.push(`"${i.set}"`);
-  if (/35(?:th)?\s*anniversary/i.test(text)) clues.push('35th Anniversary');
-  if (/football/i.test(text)) clues.push('football card');
-  else if (/basketball/i.test(text)) clues.push('basketball card');
-  else if (/baseball/i.test(text)) clues.push('baseball card');
-  else clues.push('trading card');
-  clues.push('checklist exact card number set year');
-  return clues.join(' ').replace(/\s+/g, ' ').trim().slice(0, 390);
+function buildLookupQueries(i = {}, front, back) {
+  const rawText = allReadText(front, back).join(' ');
+  const code = i.cardNo || extractCardCodeFromText(rawText);
+  const subject = i.subject || front?.identity?.subject || back?.identity?.subject || '';
+  const brand = normalizeBrand(i.brand || detectBrandFromReads(front, back)) || '';
+  const setClues = [...(front?.identity?.set_clues || []), ...(back?.identity?.set_clues || [])].filter(Boolean).slice(0,3).join(' ');
+  const q=[];
+  if (code) q.push([`"${code}"`, subject && `"${subject}"`, brand, 'trading card checklist set year'].filter(Boolean).join(' '));
+  if (subject) q.push([`"${subject}"`, code && `"${code}"`, brand, i.set || setClues, 'trading card'].filter(Boolean).join(' '));
+  if (!q.length && rawText) q.push(`${rawText.slice(0,220)} trading card identify set card number`);
+  return [...new Set(q.map(x=>x.replace(/\s+/g,' ').trim()).filter(Boolean))];
 }
+
+function buildLookupQuery(i = {}, front, back) { return buildLookupQueries(i, front, back)[0] || ''; }
 
 function applyWebIdentity(analysis, web, front, back) {
   const out = structuredClone(analysis);
@@ -622,6 +629,38 @@ function applyWebIdentity(analysis, web, front, back) {
   }
   return applyDeterministicIdentity(out, front, back);
 }
+
+async function resolveIdentityFromWeb(env, analysis, web, front, back) {
+  if (!web?.results?.length) return analysis;
+  const clues = {
+    visualIdentity: analysis.identity || {},
+    cardCode: extractBestCardCode(front, back),
+    visibleText: allReadText(front, back).slice(0, 30),
+    searchAnswer: web.answer,
+    searchResults: web.results.slice(0, 10).map(x => ({title:x.title,url:x.url,content:x.content})),
+  };
+  const prompt = `Identify ONE collectible trading card from visual text clues plus live web search results. Return ONLY valid JSON. Do not use a statistics season as the product release year. Treat an alphanumeric card code (example 91TF-2) as stronger evidence than a jersey number. Prefer exact checklist/manufacturer/database matches across multiple sources. If a field is not supportable, use null.\n\nINPUT:\n${JSON.stringify(clues)}\n\nRETURN:\n{"year":number|null,"brand":string|null,"set":string|null,"subject":string|null,"cardNo":string|null,"variation":string|null,"team":string|null,"category":"Sports|TCG|Non-sport|Other|null","confidence":number,"evidence":["..."]}`;
+  const raw = await env.AI.run(TEXT_MODEL, {messages:[{role:'system',content:'You identify trading cards from corroborated web evidence. Return JSON only.'},{role:'user',content:prompt}],temperature:0.02,max_tokens:900,stream:false});
+  const obj = parseModelJSON(modelText(raw), 'web identity');
+  const out = structuredClone(analysis);
+  out.identity ||= {};
+  for (const k of ['year','brand','set','subject','cardNo','variation','team','category']) if (obj[k] !== null && obj[k] !== undefined && obj[k] !== '') out.identity[k] = k==='brand' ? normalizeBrand(obj[k]) : obj[k];
+  out.identity_confidence = clamp(Number(obj.confidence)||out.identity_confidence||0,0,100);
+  out.evidence = Array.from(new Set([...(out.evidence||[]), ...(Array.isArray(obj.evidence)?obj.evidence:[])])).slice(0,10);
+  if (out.identity.cardNo && out.identity.subject && out.identity.year && out.identity.set && out.identity_confidence >= 75) { out.needs_review=false; out.review_reason=null; }
+  return out;
+}
+
+async function tavilyEbayLookup(env, identity = {}) {
+  const query = buildQuery(identity);
+  const searchUrl = query ? `https://www.ebay.com/sch/i.html?_nkw=${encodeURIComponent(query)}` : 'https://www.ebay.com/';
+  if (!query) return {configured:true,items:[],query,searchUrl};
+  const q = `${query} current eBay listing`;
+  const b = await tavilySearch(env, q, 8, ['ebay.com']);
+  const items = (b.results||[]).slice(0,6).map(x=>({title:x.title,url:x.url,price:extractPrice(`${x.title||''} ${x.content||''}`),content:x.content}));
+  return {configured:true,items,query,searchUrl,source:'Tavily web-indexed eBay results'};
+}
+function extractPrice(text){const m=String(text||'').match(/\$\s*([0-9]{1,6}(?:\.[0-9]{2})?)/);return m?Number(m[1].replace(/,/g,'')):null;}
 
 function scoreWebResult(r, i, front, back) {
   const t = `${r.title || ''} ${r.content || ''}`.toLowerCase();
