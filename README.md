@@ -1,7 +1,17 @@
-# Card Lab Cloudflare Worker v3.0.1
+# Card Lab Cloudflare Worker v3.0.2
 
-## What changed from v3.0.0
-This is a backend-only eBay environment update. The Card Lab 3.0 identity, condition, market filtering, identity-lock, `/market`, and grading-support architecture is preserved.
+## What changed from v3.0.1
+This is a stabilization release. It preserves the v3 market/identity-lock architecture and fixes three failure modes found by the Travis Hunter regression card.
+
+- Card-number hypotheses now come from physical-card OCR first; generic Google/web URL slugs cannot seed a card number.
+- Trusted-source recovery can still establish an exact card number when OCR misses it, but only from explicit card-number text in trusted source results/matching-page titles.
+- Set and parallel are separated deterministically when a trusted source embeds a known parallel name in the set title; detected serial numbering is preserved with the variation.
+- Condition inspection now requests structured JSON first, retries conservatively, accepts flexible JSON/KV output, and uses a text model only to normalize values already stated by the vision model.
+- Condition failures are explicit rather than silently producing a 0%-confidence pseudo-result.
+- eBay Sandbox/Production handling from v3.0.1 is unchanged.
+
+## Prior v3 architecture preserved
+ The Card Lab 3.0 identity, condition, market filtering, identity-lock, `/market`, and grading-support architecture is preserved.
 
 - Added explicit eBay environment handling.
 - Sandbox is the default and is explicitly set with `EBAY_ENV=sandbox` in `wrangler.jsonc`.
@@ -11,7 +21,6 @@ This is a backend-only eBay environment update. The Card Lab 3.0 identity, condi
 - `/health` now reports `ebayEnvironment` in addition to whether eBay credentials are configured.
 - Market responses include the active eBay environment when the official Browse API is used.
 
-## Existing v3.0 architecture preserved
 ### Identity
 - Google Cloud Vision OCR/Web Detection extracts visual/text clues.
 - Tavily searches trusted card sources/checklists.

@@ -1,4 +1,4 @@
-const VERSION = '3.0.1';
+const VERSION = '3.0.2';
 const DEFAULT_ORIGIN = 'https://darknight909.github.io';
 const CONDITION_MODEL = '@cf/moondream/moondream3.1-9B-A2B';
 const TEXT_MODEL = '@cf/meta/llama-3.3-70b-instruct-fp8-fast';
@@ -10,6 +10,10 @@ const TRUSTED_CARD_DOMAINS = [
 const OFFICIAL_DOMAINS = ['topps.com','fanaticscollect.com','paniniamerica.net','upperdeck.com','leaftradingcards.com'];
 const STRONG_REFERENCE_DOMAINS = ['beckett.com','tcdb.com','cardboardconnection.com','cardboardchecklist.com'];
 const PARALLEL_WORDS = ['refractor','prizm','parallel','crackle','wave','x-fractor','xfractor','sepia','negative','aqua','blue','green','red','orange','pink','purple','gold','black','silver','rainbow','diamante','foil','shimmer','sparkle','atomic','mojo','superfractor','image variation','variation'];
+const CARD_CODE_REJECT_WORDS = new Set([
+  'TOPPS','PANINI','BOWMAN','UPPER','DECK','FLAGSHIP','FOOTBALL','BASEBALL','BASKETBALL',
+  'HOCKEY','SOCCER','TRADING','CARD','CARDS','CHECKLIST','ANNIVERSARY','CHROME','PRIZM'
+]);
 
 let ebayTokenCache = { token: null, expiresAt: 0, cacheKey: null };
 
@@ -148,7 +152,7 @@ export default {
         },
         pipeline: {
           identity: lockedIdentity ? 'Verified identity lock reused' : 'Google OCR/Web Detection → trusted-source exact-card verification',
-          condition: 'Cloudflare Workers AI visible-condition inspection with automatic retry on incomplete output',
+          condition: 'Cloudflare Workers AI visible-condition inspection with structured parsing, retry, and conservative text-only normalization on malformed output',
           centering: 'Measured locally; vision cross-check is used only as a disagreement guard',
           grading: 'Calculated locally from published grading standards/guidelines',
           market: market.live ? 'Official eBay Browse API keyword/image matching' : 'Web-indexed fallback until eBay API credentials are connected',
@@ -327,14 +331,24 @@ function exactTokenPresent(text, token) {
   return new RegExp(`(^|[^A-Z0-9])${pattern}($|[^A-Z0-9])`,'i').test(t);
 }
 
+function isPlausibleCardCode(value, explicit=false) {
+  const v=String(value||'').toUpperCase().replace(/^#/,'').trim().replace(/\s*-\s*/g,'-');
+  if (!v || !/[0-9]/.test(v) || isDateLikeCardCode(v)) return false;
+  if (/^(19|20)\d{2}$/.test(v)) return false;
+  if (v.length > (explicit ? 18 : 14)) return false;
+  const parts=v.split(/[-_]/).filter(Boolean);
+  if (parts.some(p=>CARD_CODE_REJECT_WORDS.has(p))) return false;
+  if (parts.some(p=>/^(19|20)\d{2}$/.test(p)) && !explicit) return false;
+  if (!explicit && !/[A-Z]/.test(v)) return false;
+  return true;
+}
+
 function extractCardCandidates(text) {
   const raw = String(text || '').toUpperCase();
   const out = new Map();
-  const add = (v, baseScore, index = 0) => {
-    v = String(v || '').replace(/^#/, '').trim().replace(/[),.;:]+$/,'');
-    if (!v || v.length > 24 || !/[0-9]/.test(v)) return;
-    if (/^(19|20)\d{2}$/.test(v) || isDateLikeCardCode(v)) return;
-    if (/^\d{1,2}$/.test(v) && baseScore<100) return;
+  const add = (v, baseScore, index = 0, explicit=false) => {
+    v = String(v || '').replace(/^#/, '').trim().replace(/\s*-\s*/g,'-').replace(/[),.;:]+$/,'');
+    if (!isPlausibleCardCode(v, explicit)) return;
     const before = raw.slice(Math.max(0,index-42),index);
     const after = raw.slice(index+String(v).length,Math.min(raw.length,index+String(v).length+42));
     const ctx = `${before} ${after}`;
@@ -342,29 +356,41 @@ function extractCardCandidates(text) {
     if (/(?:CARD\s*(?:NO\.?|NUMBER|#)|NO\.?\s*#?)\s*[:#-]?\s*$/i.test(before)) score += 35;
     if (/\b(?:DOB|BORN|BIRTH|BIRTHDAY|DATE OF BIRTH|HT|HEIGHT|WT|WEIGHT)\b/i.test(ctx) && !/[A-Z]/.test(v) && baseScore<100) score -= 180;
     if (/\b(?:STATS?|STATISTICS|REC|YDS|AVG|TD|SEASON)\b/i.test(ctx) && !/[A-Z]/.test(v) && baseScore<100) score -= 80;
-    if (/^[0-9-]+$/.test(v) && v.includes('-')) return; // dates/stat strings, not normal card codes
-    if (!/[A-Z]/.test(v) && !/(?:CARD\s*(?:NO\.?|NUMBER|#)|NO\.?\s*#?)/i.test(before)) score -= 35;
     if (score < 40) return;
     const old = out.get(v);
-    if (!old || old.score < score) out.set(v, { value:v, score, context:cleanLong(ctx.replace(/\s+/g,' '),130) });
+    if (!old || old.score < score) out.set(v, { value:v, score, context:cleanLong(ctx.replace(/\s+/g,' '),130), origin:'ocr' });
   };
 
-  const patterns = [
-    { re:/\b[A-Z0-9]{1,10}-[A-Z0-9]{1,10}(?:-[A-Z0-9]{1,8})?\b/g, score:145 },
-    { re:/\b(?=[A-Z0-9]{3,16}\b)(?=[A-Z0-9]*[A-Z])(?=[A-Z0-9]*\d)[A-Z0-9]{3,16}\b/g, score:85 },
-  ];
-  for (const {re,score} of patterns) {
-    let m;
-    while ((m = re.exec(raw))) add(m[0],score,m.index);
-  }
-  const contextual = /(?:CARD\s*(?:NO\.?|NUMBER|#)|NO\.?\s*#?)\s*[:#-]?\s*([A-Z0-9-]{1,18})/gi;
+  // OCR often inserts spaces/newlines around hyphens; normalize those into one code.
+  const hyphenated = /\b[A-Z0-9]{1,10}\s*-\s*[A-Z0-9]{1,10}(?:\s*-\s*[A-Z0-9]{1,8})?\b/g;
   let m;
-  while ((m=contextual.exec(raw))) add(m[1],125,m.index + m[0].indexOf(m[1]));
-  const numericContext = /(?:CARD\s*(?:NO\.?|NUMBER|#)|NO\.?\s*#?)\s*[:#-]?\s*([0-9]{1,4})\b/gi;
-  while ((m=numericContext.exec(raw))) add(m[1],115,m.index + m[0].indexOf(m[1]));
-  const hashNumeric = /#\s*([0-9]{1,4})\b/g;
-  while ((m=hashNumeric.exec(raw))) add(m[1],108,m.index + m[0].indexOf(m[1]));
+  while ((m=hyphenated.exec(raw))) add(m[0],150,m.index,false);
+
+  const compact = /\b(?=[A-Z0-9]{3,14}\b)(?=[A-Z0-9]*[A-Z])(?=[A-Z0-9]*\d)[A-Z0-9]{3,14}\b/g;
+  while ((m=compact.exec(raw))) add(m[0],88,m.index,false);
+
+  const contextual = /(?:CARD\s*(?:NO\.?|NUMBER|#)|NO\.?\s*#?)\s*[:#-]?\s*([A-Z0-9]{1,10}(?:\s*-\s*[A-Z0-9]{1,10}){0,2})/gi;
+  while ((m=contextual.exec(raw))) add(m[1],132,m.index + m[0].indexOf(m[1]),true);
+
+  const hashCode = /#\s*([A-Z0-9]{1,10}(?:\s*-\s*[A-Z0-9]{1,10}){0,2})\b/g;
+  while ((m=hashCode.exec(raw))) add(m[1],125,m.index + m[0].indexOf(m[1]),true);
+
   return [...out.values()].sort((a,b)=>b.score-a.score || b.value.length-a.value.length).slice(0,12);
+}
+
+function extractTrustedSourceCodes(text) {
+  const raw=String(text||'').toUpperCase();
+  const out=[];
+  const seen=new Set();
+  const push=v=>{
+    v=String(v||'').replace(/^#/,'').trim().replace(/\s*-\s*/g,'-');
+    if (!isPlausibleCardCode(v,true) || seen.has(v)) return;
+    seen.add(v); out.push(v);
+  };
+  let m;
+  const explicit=/(?:CARD\s*(?:NO\.?|NUMBER|#)|NO\.?\s*#?|#)\s*[:#-]?\s*([A-Z0-9]{1,10}(?:\s*-\s*[A-Z0-9]{1,10}){0,2})/gi;
+  while ((m=explicit.exec(raw))) push(m[1]);
+  return out.slice(0,8);
 }
 
 function detectBrandFromText(text) {
@@ -413,11 +439,7 @@ function extractSerialNumber(text) {
 function provisionalFromGoogle(g) {
   const ocr = allGoogleText(g);
   const web = allGoogleWebText(g);
-  const ocrCandidates = extractCardCandidates(`${g?.back?.fullText || ''}\n${g?.front?.fullText || ''}`);
-  const webCandidates = extractCardCandidates(web);
-  const candidates = [...ocrCandidates];
-  for (const x of webCandidates) if (!candidates.some(y=>normalizeLooseToken(y.value)===normalizeLooseToken(x.value))) candidates.push({...x,score:x.score-10});
-  candidates.sort((a,b)=>b.score-a.score);
+  const candidates = extractCardCandidates(`${g?.back?.fullText || ''}\n${g?.front?.fullText || ''}`);
   const brand = normalizeBrand(detectBrandFromText(`${ocr}\n${web}`));
   const years = extractYearsWithContext(ocr);
   const copyrightYears = years.filter(x => x.role === 'copyright').map(x => x.year);
@@ -543,6 +565,53 @@ async function trustedCardLookup(env, provisional, google) {
   return {configured:true,used:true,query:queries[0]||'',queries,answer:null,results};
 }
 
+function recoverTrustedCardCode(results, google) {
+  const scored=new Map();
+  for (const r of results||[]) {
+    const trust=Number(r.trustTier||domainTrust(r.url));
+    for (const code of extractTrustedSourceCodes(`${r.title||''} ${r.content||''}`)) {
+      const key=normalizeLooseToken(code);
+      const old=scored.get(key)||{code,score:0,domains:new Set()};
+      old.score += trust>=4?70:trust===3?55:trust===2?25:10;
+      if (r.url) old.domains.add(hostnameOf(r.url));
+      scored.set(key,old);
+    }
+  }
+  for (const p of collectGooglePages(google)) {
+    for (const code of extractTrustedSourceCodes(p.title||'')) {
+      const key=normalizeLooseToken(code);
+      const old=scored.get(key)||{code,score:0,domains:new Set()};
+      old.score += (p.fullMatches?45:p.partialMatches?20:8);
+      scored.set(key,old);
+    }
+  }
+  const ranked=[...scored.values()].sort((a,b)=>(b.score+b.domains.size*20)-(a.score+a.domains.size*20));
+  return ranked[0]?.code || null;
+}
+
+function separateSetAndVariation(setName, variation, evidenceTexts, serialNumber) {
+  let set=clean(setName), v=clean(variation);
+  if (!set) return {set:null,variation:v};
+  const evidence=String((evidenceTexts||[]).join(' ')).toLowerCase();
+  if (!v) {
+    const words=[...PARALLEL_WORDS].sort((a,b)=>b.length-a.length);
+    for (const word of words) {
+      const re=new RegExp(`(?:\\\\s*[-–—:]\\\\s*)?\\\\b${escapeRegex(word)}\\\\b(?:\\\\s+parallel)?\\\\s*$`,'i');
+      if (!re.test(set)) continue;
+      const evidenceSupports=evidence.includes(word.toLowerCase());
+      if (!evidenceSupports) continue;
+      v=word.replace(/\b\w/g,m=>m.toUpperCase());
+      set=clean(set.replace(re,'').replace(/\s*[-–—:]\s*$/,''));
+      break;
+    }
+  }
+  if (v && serialNumber && /\/\d+$/.test(serialNumber) && !new RegExp(`/\\d+$`).test(v)) {
+    const total=String(serialNumber).split('/')[1];
+    if (total) v=`${v} /${total}`;
+  }
+  return {set,variation:v};
+}
+
 async function resolveIdentityFromSources(env, google, provisional, webLookup) {
   const candidates=(provisional.cardCandidates||[]).slice(0,5);
   const trusted=(webLookup?.results||[]).map(x=>sourceEvidence(x,provisional.cardNo));
@@ -559,6 +628,7 @@ async function resolveIdentityFromSources(env, google, provisional, webLookup) {
     if (score>selectedScore){selectedScore=score;selectedCode=c.value;}
   }
   if (!selectedCode) selectedCode=provisional.cardNo;
+  if (!selectedCode) selectedCode=recoverTrustedCardCode(trusted,google);
 
   const exactSources=trusted.filter(x=>selectedCode&&exactTokenPresent(`${x.title||''} ${x.content||''}`,selectedCode));
   const exactGooglePages=pages.filter(x=>selectedCode&&exactTokenPresent(x.title||'',selectedCode));
@@ -579,9 +649,9 @@ async function resolveIdentityFromSources(env, google, provisional, webLookup) {
 Rules:
 - cardNo must be exactly the selectedCardCode if the sources support it.
 - year must be the product/release year shown by a trusted source, never a birth/statistics/design year.
-- set must preserve the actual product/set/insert wording from the sources.
+- set must preserve the actual product/set/insert wording from the sources, but exclude a color/parallel name when that parallel is separately identifiable.
 - subject is the player/character/person on that exact card number.
-- variation must be null unless the sources or matching-page evidence specifically identify a parallel/variation that matches the photographed card. Do not infer a color parallel from generic artwork.
+- variation must be null unless the sources or matching-page evidence specifically identify a parallel/variation that matches the photographed card. If a source title ends with a known color/parallel (for example Green), put that in variation, not in set. Do not infer a color parallel from generic artwork.
 - team may be null.
 - category is Sports, TCG, Non-sport, Other, or null.
 - source_indices must name only exactTrustedSources entries actually supporting the identity.
@@ -617,6 +687,9 @@ RETURN:
   const used=sourceIdx.map(i=>exactSources[i]).filter(Boolean);
   const supporting=used.length?used:exactSources;
   const sourceTexts=supporting.map(x=>`${x.title||''} ${x.content||''}`);
+  const split=separateSetAndVariation(identity.set,identity.variation,[...sourceTexts,...exactGooglePages.map(p=>p.title||'')],provisional.serialNumber);
+  identity.set=split.set;
+  identity.variation=split.variation;
   if (identity.subject && !sourceTexts.some(t=>containsSubject(t,identity.subject))) identity.subject=null;
   if (identity.year && !sourceTexts.some(t=>new RegExp(`\\b${identity.year}\\b`).test(t))) identity.year=null;
   if (identity.set && !sourceTexts.some(t=>containsSet(t,identity.set))) identity.set=null;
@@ -728,22 +801,16 @@ function identityMarketReady(analysis) {
 
 async function inspectConditionSide(env, side, image) {
   const primaryQuestion = `Inspect ONLY the visible physical condition of the ${side} of one raw trading card.
+Do not identify the card. Do not invent defects. If something cannot be judged, return null.
 
-Return SIMPLE KEY=VALUE lines, no markdown. If a category cannot be judged reliably from this single photo, use UNKNOWN rather than guessing.
+Return ONLY a JSON object with exactly these keys:
+{"corners":number|null,"edges":number|null,"surface":number|null,"focus":number|null,"defects":["crease"|"dent"|"stain"|"scratch"|"printline"|"mark"|"possible_alteration"],"confidence":number,"center_lr":"55/45"|null,"center_tb":"52/48"|null,"center_confidence":number,"notes":["short visible evidence"]}
 
-Scores are 1-10 in 0.5 increments:
-- 10 = no visible defect at this photo's resolution
-- 9-9.5 = minute visible issue
-- 8-8.5 = minor visible issue
-- 7-7.5 = clearly visible moderate issue
-- below 7 requires a clearly visible named defect; otherwise UNKNOWN
+Scores use 1-10 in 0.5 increments. Scores below 7 require a clearly visible named defect.
+FOCUS means print/focus/registration quality on the card, not camera sharpness.
+Centering is printed-design centering only and must be null unless a clear printed border/design frame can be distinguished from the physical card edge.`;
 
-Also estimate PRINT CENTERING only if a clear printed border/design frame can be distinguished from the physical card edge. If not, use UNKNOWN.
-CENTER_LR is left/right percentage, e.g. 55/45.
-CENTER_TB is top/bottom percentage, e.g. 52/48.
-CENTER_CONFIDENCE is 0-100.
-
-Use exactly:
+  const fallbackQuestion = `Inspect the visible physical condition of this ${side} raw trading card only. Return ONLY KEY=VALUE lines:
 CORNERS=
 EDGES=
 SURFACE=
@@ -754,43 +821,116 @@ CENTER_LR=
 CENTER_TB=
 CENTER_CONFIDENCE=
 NOTES=
-
-DEFECTS: comma-separated only from crease,dent,stain,scratch,printline,mark,possible_alteration, or NONE.
-FOCUS is print/focus/registration quality visible on the card, not camera sharpness.
-CONFIDENCE is 0-100 for how reliably this photo supports the condition scores.
-NOTES must briefly name visible evidence for any score below 9.`;
-
-  const fallbackQuestion = `Inspect this ${side} trading-card photo. Return ONLY these KEY=VALUE lines:
-CORNERS=
-EDGES=
-SURFACE=
-FOCUS=
-DEFECTS=
-CONFIDENCE=
-CENTER_LR=
-CENTER_TB=
-CENTER_CONFIDENCE=
-NOTES=
-Use 1-10 scores in 0.5 increments or UNKNOWN. Do not invent defects. DEFECTS is NONE or crease,dent,stain,scratch,printline,mark,possible_alteration. Centering is printed-design centering only, formatted like 55/45, or UNKNOWN.`;
+Use 1-10 scores in 0.5 increments or UNKNOWN. DEFECTS is NONE or crease,dent,stain,scratch,printline,mark,possible_alteration. Use UNKNOWN when uncertain.`;
 
   try {
     const raw = await env.AI.run(CONDITION_MODEL, {
-      task:'query', image, question:primaryQuestion, reasoning:true, temperature:0, max_tokens:1100, stream:false,
+      task:'query', image, question:primaryQuestion, reasoning:false, temperature:0, max_tokens:1000, stream:false,
     });
-    let parsed=parseConditionKV(modelText(raw),side);
-    if (conditionCompleteness(parsed) >= 4 && parsed.confidence >= 30) return parsed;
+    const primaryText=modelText(raw);
+    let parsed=parseConditionFlexible(primaryText,side);
+    if (conditionCompleteness(parsed) >= 4 && parsed.confidence >= 30) {
+      parsed.diagnostic='primary-structured';
+      return parsed;
+    }
 
     const retry = await env.AI.run(CONDITION_MODEL, {
-      task:'query', image, question:fallbackQuestion, reasoning:false, temperature:0, max_tokens:700, stream:false,
+      task:'query', image, question:fallbackQuestion, reasoning:false, temperature:0, max_tokens:800, stream:false,
     });
-    const second=parseConditionKV(modelText(retry),side);
-    if (conditionCompleteness(second) > conditionCompleteness(parsed) || second.confidence > parsed.confidence) {
-      second.notes.unshift('Condition model required one automatic retry for a complete response.');
-      parsed=second;
+    const retryText=modelText(retry);
+    const second=parseConditionFlexible(retryText,side);
+    if (conditionCompleteness(second) > conditionCompleteness(parsed) || second.confidence > parsed.confidence) parsed=second;
+    if (conditionCompleteness(parsed) >= 4 && parsed.confidence >= 30) {
+      parsed.notes.unshift('Condition model required one automatic retry for a complete response.');
+      parsed.diagnostic='retry-flexible';
+      return parsed;
+    }
+
+    // Last-resort structure repair: the text model may only normalize values the
+    // vision model explicitly stated. It is not allowed to add a visual judgment.
+    const sourceText=[primaryText,retryText].filter(Boolean).join('\n---RETRY---\n').slice(0,7000);
+    if (sourceText && env.AI) {
+      const repaired=await normalizeConditionOutput(env,side,sourceText);
+      if (conditionCompleteness(repaired) > conditionCompleteness(parsed) || repaired.confidence > parsed.confidence) parsed=repaired;
+    }
+    parsed.diagnostic=conditionCompleteness(parsed)>=4?'text-normalized':'insufficient-model-output';
+    if (conditionCompleteness(parsed)<4) {
+      parsed.confidence=Math.min(parsed.confidence||0,25);
+      parsed.notes.push('Automatic condition scores withheld because the vision response did not contain all required measurable fields.');
     }
     return parsed;
   } catch (e) {
     return unknownConditionSide(side, `Condition model unavailable: ${cleanError(e)}`);
+  }
+}
+
+function parseConditionFlexible(text, side) {
+  const raw=String(text||'').trim();
+  if (raw) {
+    const cleaned=raw.replace(/^```(?:json)?\s*/i,'').replace(/\s*```$/i,'');
+    const a=cleaned.indexOf('{'), b=cleaned.lastIndexOf('}');
+    if (a>=0 && b>a) {
+      try {
+        const obj=JSON.parse(cleaned.slice(a,b+1));
+        return conditionFromObject(obj,side);
+      } catch {}
+    }
+  }
+  return parseConditionKV(raw,side);
+}
+
+function conditionFromObject(obj, side) {
+  const score=v=>{
+    if (v==null || /^(unknown|null|n\/a)$/i.test(String(v))) return null;
+    const n=Number(String(v).match(/\d+(?:\.\d+)?/)?.[0]);
+    return Number.isFinite(n)&&n>=1&&n<=10?clampHalf(n,1,10):null;
+  };
+  const defects=Array.isArray(obj?.defects)?obj.defects.map(x=>String(x).toLowerCase()):String(obj?.defects||'').toLowerCase().split(/[,;|]/).map(x=>x.trim());
+  const has=k=>defects.some(x=>x.replace(/[- ]/g,'_')===k);
+  const lr=parsePair(obj?.center_lr ?? obj?.CENTER_LR);
+  const tb=parsePair(obj?.center_tb ?? obj?.CENTER_TB);
+  const conf=clamp(Math.round(Number(obj?.confidence ?? obj?.CONFIDENCE) || 0),0,100);
+  const centerConf=clamp(Math.round(Number(obj?.center_confidence ?? obj?.CENTER_CONFIDENCE) || 0),0,100);
+  const notes=Array.isArray(obj?.notes)?obj.notes:[obj?.notes ?? obj?.NOTES];
+  return {
+    side,
+    corners:score(obj?.corners ?? obj?.CORNERS),
+    edges:score(obj?.edges ?? obj?.EDGES),
+    surface:score(obj?.surface ?? obj?.SURFACE),
+    focus:score(obj?.focus ?? obj?.FOCUS),
+    defects:{crease:has('crease'),dent:has('dent'),stain:has('stain'),scratch:has('scratch'),printline:has('printline'),mark:has('mark'),possible_alteration:has('possible_alteration')},
+    confidence:conf,
+    centering:{lr,tb,confidence:lr&&tb?centerConf:0},
+    notes:notes.map(clean).filter(Boolean).slice(0,6),
+  };
+}
+
+async function normalizeConditionOutput(env, side, text) {
+  const prompt=`Convert the following vision-model output into one JSON object. Do NOT add any observation, score, defect, or centering value that is not explicitly stated in the source. Missing/uncertain values must be null. Confidence must be 0 if the source states no confidence.
+
+SOURCE (${side}):
+${text}
+
+RETURN ONLY:
+{"corners":number|null,"edges":number|null,"surface":number|null,"focus":number|null,"defects":[],"confidence":number,"center_lr":string|null,"center_tb":string|null,"center_confidence":number,"notes":[]}`;
+  try {
+    const raw=await env.AI.run(TEXT_MODEL,{
+      messages:[
+        {role:'system',content:'You only normalize supplied text into JSON. Never infer missing visual facts.'},
+        {role:'user',content:prompt}
+      ],
+      response_format:{type:'json_object'},
+      temperature:0,
+      max_tokens:700,
+      stream:false
+    });
+    const obj=structuredModelResult(raw,'condition normalizer');
+    const out=conditionFromObject(obj,side);
+    out.notes.unshift('Condition response was normalized from the vision model without adding new visual judgments.');
+    return out;
+  } catch(e) {
+    const out=unknownConditionSide(side,`Condition response could not be normalized: ${cleanError(e)}`);
+    return out;
   }
 }
 
@@ -856,7 +996,7 @@ function unknownConditionSide(side, note) {
   return {
     side,corners:null,edges:null,surface:null,focus:null,
     defects:{crease:false,dent:false,stain:false,scratch:false,printline:false,mark:false,possible_alteration:false},
-    confidence:0,centering:{lr:null,tb:null,confidence:0},notes:[note]
+    confidence:0,centering:{lr:null,tb:null,confidence:0},diagnostic:'unavailable',notes:[note]
   };
 }
 
