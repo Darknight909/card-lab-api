@@ -1,4 +1,4 @@
-# Card Lab Cloudflare Worker v9.0.0
+# Card Lab Cloudflare Worker v10.0.0
 
 Card Lab API 5.0 is a stage-isolated optimization release. It preserves the v4 evidence-gated identity and market architecture while adding reference-assisted analysis, targeted retries, and stronger fail-closed validation.
 
@@ -111,3 +111,11 @@ After deployment, Card Lab → Settings → Test connection should report API `v
 - Centering now measures the printed frame *inside a separately detected physical card rectangle*, rather than relative to the photograph itself.
 - Exact 50/50-style detection defaults and extreme vision-only centering are rejected unless corroborated by a verified exact-card reference.
 - Card Lab can discover reference images from card-specific trusted source pages via OpenGraph/Twitter image metadata when Google Web Detection does not supply one.
+
+
+## v10.0.0 root-cause fixes
+- Workers AI responses are recursively unwrapped using documented answer/chat fields; wrapper metrics can no longer leak into visible condition evidence.
+- Serialized metadata, prompt placeholders, and generic example text are rejected as physical-condition evidence.
+- Moondream detect output is recursively unwrapped before centering geometry is evaluated.
+- Near-perfect 50/50 centering cannot rescue local centering without a close verified-reference match.
+- Regression tests include the exact response-wrapper contamination pattern observed in v9.

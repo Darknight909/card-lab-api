@@ -1,4 +1,4 @@
-const VERSION = '9.0.0';
+const VERSION = '10.0.0';
 const DEFAULT_ORIGIN = 'https://darknight909.github.io';
 const CONDITION_PRIMARY_MODEL = '@cf/google/gemma-4-26b-a4b-it';
 const CONDITION_FALLBACK_MODEL = '@cf/moondream/moondream3.1-9B-A2B';
@@ -1595,14 +1595,25 @@ function severityWordFromText(text){
   const m=String(text||'').toLowerCase().match(/\b(none|minute|minor|moderate|major|severe|unknown|clean|mint|tiny|trace|negligible|light|small|slight|medium|noticeable|heavy|significant|extreme|uncertain)\b/);
   return normalizeConditionSeverity(m?.[1]||'unknown');
 }
-function evidenceFromLooseText(text){
-  const t=String(text||'').replace(/```/g,' ').replace(/\s+/g,' ').trim();
+function sanitizeModelEvidence(value){
+  let t=String(value??'').replace(/```/g,' ').trim();
   if(!t)return null;
-  const explicit=t.match(/EVIDENCE\s*[:=]\s*(.*)$/i)?.[1];
+  t=t.split(/"\s*,\s*"(?:caption|finish_reason|metrics|usage|reasoning|model|id|object)"\s*:/i)[0];
+  t=t.split(/\b(?:caption|finish_reason|metrics|usage|prompt_tokens|completion_tokens|decode_time_ms|input_tokens|output_tokens)\b\s*[:=]/i)[0];
+  t=t.replace(/[}\]"]+\s*$/g,'').replace(/\\n/g,' ').replace(/\s+/g,' ').trim();
+  if(!t)return null;
+  if(/^(?:none|unknown|n\/?a|null|short visible evidence(?: or none)?|actual visible evidence|evidence)$/i.test(t))return null;
+  if(/[{}[\]]/.test(t)||t.length>220)return null;
+  return clean(t);
+}
+
+function evidenceFromLooseText(text){
+  const t=String(text||'').replace(/```/g,' ').replace(/\r/g,' ').trim();
+  if(!t)return null;
+  const explicit=t.match(/EVIDENCE\s*[:=]\s*([^\n\r]*)/i)?.[1];
   let cleaned=explicit!=null?explicit:t.replace(/^(?:severity\s*[:=]\s*)?(?:none|minute|minor|moderate|major|severe|unknown)\b[\s|:;,-]*/i,'');
   cleaned=String(cleaned||'').replace(/^EVIDENCE\s*[:=]\s*/i,'').trim();
-  if(!cleaned||/^(none|unknown|n\/?a|null)$/i.test(cleaned))return null;
-  return clean(cleaned);
+  return sanitizeModelEvidence(cleaned);
 }
 function defectsFromEvidence(notes=[]){
   const joined=String((notes||[]).join(' ')).toLowerCase();
@@ -1698,8 +1709,10 @@ Moderate/major/severe must name the visible defect in evidence. Use unknown rath
 async function runMoondreamTargetedField(env,side,image,field){
   const q=`Inspect ONLY the ${field} condition on the ${side} of this raw trading card.
 The image may contain a full-card view plus enlarged labeled crops from the SAME photograph.
-Respond on ONE LINE using this format:
-SEVERITY=<NONE|MINUTE|MINOR|MODERATE|MAJOR|SEVERE|UNKNOWN> | EVIDENCE=<short visible evidence or NONE>
+Respond on ONE LINE only.
+Write SEVERITY= followed by exactly one allowed severity.
+Then write | EVIDENCE=NONE if no defect is visible, otherwise write a concrete description of what is visibly wrong.
+Do not repeat these instructions or any example wording.
 Do not identify the card. Do not assign a numeric grade. Ignore glare/background/camera blur. UNKNOWN rather than guessing.`;
   try{
     const raw=await env.AI.run(CONDITION_FALLBACK_MODEL,{
@@ -1709,8 +1722,7 @@ Do not identify the card. Do not assign a numeric grade. Ignore glare/background
     let severity=normalizeConditionSeverity(
       text.match(/SEVERITY\s*[:=]\s*([A-Z]+)/i)?.[1] || severityWordFromText(text)
     );
-    let evidence=clean(text.match(/EVIDENCE\s*[:=]\s*(.*)$/i)?.[1] || evidenceFromLooseText(text));
-    if(evidence&&/^(none|unknown|n\/?a|null)$/i.test(evidence))evidence=null;
+    let evidence=sanitizeModelEvidence(text.match(/EVIDENCE\s*[:=]\s*([^\n\r]*)/i)?.[1]) || evidenceFromLooseText(text);
     if((CONDITION_SEVERITY_RANK[severity]??99)>=3&&!evidence)severity='unknown';
     return {severity,evidence,raw:cleanLong(text,500)};
   }catch(e){
@@ -1735,8 +1747,7 @@ function normalizeConditionSeverity(v){
 }
 function severityField(v){
   if(v&&typeof v==='object'&&!Array.isArray(v)){
-    let evidence=clean(v.evidence??v.note??v.reason);
-    if(evidence&&/^(none|unknown|n\/?a|null)$/i.test(evidence))evidence=null;
+    const evidence=sanitizeModelEvidence(v.evidence??v.note??v.reason);
     return {severity:normalizeConditionSeverity(v.severity??v.level??v.rating),evidence};
   }
   return {severity:normalizeConditionSeverity(v),evidence:null};
@@ -2002,12 +2013,26 @@ function frameWithinCardMetrics(card,frame){
 }
 function suspiciousPerfectCentering(m){
   if(!m)return true;
-  return Math.abs(m.lr[0]-50)<.15&&Math.abs(m.lr[1]-50)<.15&&Math.abs(m.tb[0]-50)<.15&&Math.abs(m.tb[1]-50)<.15;
+  const near=(p,tol=.65)=>Array.isArray(p)&&Math.abs(Number(p[0])-50)<tol&&Math.abs(Number(p[1])-50)<tol;
+  return near(m.lr)&&near(m.tb);
+}
+function modelObjects(raw){
+  const seen=new Set();
+  function walk(v,depth=0){
+    if(!v||typeof v!=='object'||depth>6||seen.has(v))return [];
+    seen.add(v);
+    if(Array.isArray(v.objects))return v.objects;
+    for(const key of ['response','result','data','output']){
+      const found=walk(v[key],depth+1);
+      if(found.length)return found;
+    }
+    return [];
+  }
+  return walk(raw);
 }
 async function detectBoxes(env,image,target,max_objects=8){
   const raw=await env.AI.run(CONDITION_FALLBACK_MODEL,{task:'detect',image,target,max_objects,stream:false});
-  const objects=raw?.objects||raw?.result?.objects||[];
-  return objects.map(normalizedDetectionBox).filter(Boolean);
+  return modelObjects(raw).map(normalizedDetectionBox).filter(Boolean);
 }
 async function detectPrintedFrame(env,image){
   try{
@@ -2048,11 +2073,12 @@ function frameCenteringResult(frame,{verifiedReference=false,referenceDistance=n
   if(!frame)return null;
   let confidence=Number(frame.confidence||0);
   if(verifiedReference){
-    if(!Number.isFinite(referenceDistance)||referenceDistance>.075)return null;
-    confidence=Math.min(95,confidence+Math.round((.075-referenceDistance)*140));
+    if(!Number.isFinite(referenceDistance)||referenceDistance>.055)return null;
+    if(frame.suspiciousPerfect && (referenceDistance>.018 || confidence<88))return null;
+    confidence=Math.min(95,confidence+Math.round((.055-referenceDistance)*165));
   }else{
     // Vision-only centering is corroborative, not authoritative. Never accept
-    // a suspicious perfect default or an extreme measurement without a verified reference.
+    // a suspicious/near-perfect default or an extreme measurement without a verified reference.
     if(frame.suspiciousPerfect||frame.worst>60||confidence<90)return null;
     confidence=Math.min(confidence,88);
   }
@@ -2839,37 +2865,94 @@ CONFIDENCE=88`, 'front',95,'test-kv');
   const loose='SEVERITY=MINOR | EVIDENCE=tiny white speck visible on lower edge';
   add('loose severity parser recovers categorical model output',severityWordFromText(loose)==='minor'&&/white speck/i.test(evidenceFromLooseText(loose)||''),{severity:severityWordFromText(loose),evidence:evidenceFromLooseText(loose)});
 
+  const wrappedMoondream={response:{answer:'SEVERITY=MINOR | EVIDENCE=tiny white speck on lower edge',caption:null,finish_reason:'stop',metrics:{input_tokens:846,decode_time_ms:551}}};
+  const wrappedText=modelText(wrappedMoondream);
+  add('Workers AI wrapper is unwrapped without leaking metrics',wrappedText==='SEVERITY=MINOR | EVIDENCE=tiny white speck on lower edge'&&!/metrics|tokens|decode/i.test(wrappedText),wrappedText);
+
+  const leaked='short visible evidence or NONE","caption":null,"finish_reason":"stop","metrics":{"input_tokens":846}';
+  add('condition evidence sanitizer rejects wrapper contamination',sanitizeModelEvidence(leaked)===null,sanitizeModelEvidence(leaked));
+
+  const nestedObjects=modelObjects({response:{objects:[{xmin:.1,ymin:.1,xmax:.9,ymax:.9,score:.9}]}});
+  add('Moondream detect wrapper is recursively unwrapped',nestedObjects.length===1,nestedObjects);
+
   return {ok:tests.every(x=>x.pass),passed:tests.filter(x=>x.pass).length,total:tests.length,tests};
 }
 
+function modelText(raw) {
+  const seen=new Set();
+  function walk(v,depth=0){
+    if(v==null||depth>6)return '';
+    if(typeof v==='string')return v.trim();
+    if(typeof v!=='object')return '';
+    if(seen.has(v))return '';
+    seen.add(v);
+    for(const key of ['answer','output_text','text']){
+      if(typeof v[key]==='string'&&v[key].trim())return v[key].trim();
+    }
+    const msg=v?.choices?.[0]?.message;
+    if(typeof msg?.content==='string'&&msg.content.trim())return msg.content.trim();
+    if(Array.isArray(msg?.content)){
+      const joined=msg.content.map(x=>typeof x==='string'?x:(x?.text||x?.content||'')).filter(Boolean).join('\n').trim();
+      if(joined)return joined;
+    }
+    if(typeof v.content==='string'&&v.content.trim())return v.content.trim();
+    for(const key of ['response','result','data','output']){
+      const t=walk(v[key],depth+1);
+      if(t)return t;
+    }
+    return '';
+  }
+  return walk(raw);
+}
+function isModelEnvelopeObject(obj){
+  if(!obj||typeof obj!=='object'||Array.isArray(obj))return false;
+  return Object.keys(obj).some(k=>['metrics','usage','finish_reason','choices','model','object','created','caption','answer','response','result','reasoning'].includes(k));
+}
+function looksLikeStructuredPayload(obj){
+  if(!obj||typeof obj!=='object'||Array.isArray(obj))return false;
+  const payloadKeys=['year','brand','set','subject','cardNo','variation','team','category','confidence','corners','edges','surface','focus','defects','center_lr','center_tb','measurable','card_shape','border_style','measurable_frame','notes'];
+  return payloadKeys.some(k=>Object.prototype.hasOwnProperty.call(obj,k));
+}
 function structuredModelResult(raw,label) {
   if(!raw) throw new Error(`${label} returned no result.`);
-  if(raw.response && typeof raw.response==='object' && !Array.isArray(raw.response)) return raw.response;
-  if(raw.result && typeof raw.result==='object' && !Array.isArray(raw.result)) return raw.result;
-  const msg=raw.choices?.[0]?.message;
+  const msg=raw?.choices?.[0]?.message;
   if(msg?.parsed && typeof msg.parsed==='object') return msg.parsed;
-  if(typeof msg?.content==='string') return parseModelJSON(msg.content,label);
-  if(typeof raw.response==='string') return parseModelJSON(raw.response,label);
-  if(typeof raw.answer==='string') return parseModelJSON(raw.answer,label);
-  return parseModelJSON(modelText(raw),label);
+  if(typeof msg?.content==='string'){try{return parseModelJSON(msg.content,label)}catch{}}
+  for(const candidate of [raw,raw?.response,raw?.result,raw?.data,raw?.output]){
+    if(looksLikeStructuredPayload(candidate)&&!isModelEnvelopeObject(candidate))return candidate;
+    if(candidate&&typeof candidate==='object'){
+      const nested=modelText(candidate);
+      if(nested){try{return parseModelJSON(nested,label)}catch{}}
+    }
+  }
+  const text=modelText(raw);
+  if(text)return parseModelJSON(text,label);
+  throw new Error(`${label} returned no readable structured payload.`);
 }
-function modelText(raw) {
-  if(typeof raw==='string') return raw;
-  if(!raw) return '';
-  if(typeof raw.answer==='string') return raw.answer;
-  if(typeof raw.response==='string') return raw.response;
-  if(typeof raw.result==='string') return raw.result;
-  const c=raw.choices?.[0]?.message?.content;
-  if(typeof c==='string') return c;
-  if(Array.isArray(c)) return c.map(x=>x?.text||'').join('\n');
-  return JSON.stringify(raw);
+function extractBalancedJson(text){
+  const s=String(text||'');
+  for(let start=0;start<s.length;start++){
+    if(s[start]!=='{')continue;
+    let depth=0,inString=false,escape=false;
+    for(let i=start;i<s.length;i++){
+      const ch=s[i];
+      if(inString){if(escape)escape=false;else if(ch==='\\')escape=true;else if(ch==='"')inString=false;continue}
+      if(ch==='"'){inString=true;continue}
+      if(ch==='{')depth++;
+      else if(ch==='}'){
+        depth--;
+        if(depth===0){const piece=s.slice(start,i+1);try{return JSON.parse(piece)}catch{break}}
+      }
+    }
+  }
+  return null;
 }
 function parseModelJSON(text,label) {
   if(typeof text!=='string') throw new Error(`${label} returned no text.`);
   const cleaned=text.trim().replace(/^```(?:json)?\s*/i,'').replace(/\s*```$/i,'');
   try{return JSON.parse(cleaned)}catch{}
-  const start=cleaned.indexOf('{'),end=cleaned.lastIndexOf('}');
-  if(start>=0&&end>start){try{return JSON.parse(cleaned.slice(start,end+1))}catch{}}
+  const balanced=extractBalancedJson(cleaned);
+  if(balanced)return balanced;
   throw new Error(`${label} returned an unreadable response.`);
 }
 
