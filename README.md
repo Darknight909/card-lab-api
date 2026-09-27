@@ -1,61 +1,55 @@
-# Card Lab Cloudflare Worker v3.0.2
+# Card Lab Cloudflare Worker v4.0.0
 
-## What changed from v3.0.1
-This is a stabilization release. It preserves the v3 market/identity-lock architecture and fixes three failure modes found by the Travis Hunter regression card.
+## Major changes
+Card Lab 4.0 is an optimization release rather than a narrow patch.
 
-- Card-number hypotheses now come from physical-card OCR first; generic Google/web URL slugs cannot seed a card number.
-- Trusted-source recovery can still establish an exact card number when OCR misses it, but only from explicit card-number text in trusted source results/matching-page titles.
-- Set and parallel are separated deterministically when a trusted source embeds a known parallel name in the set title; detected serial numbering is preserved with the variation.
-- Condition inspection now requests structured JSON first, retries conservatively, accepts flexible JSON/KV output, and uses a text model only to normalize values already stated by the vision model.
-- Condition failures are explicit rather than silently producing a 0%-confidence pseudo-result.
-- eBay Sandbox/Production handling from v3.0.1 is unchanged.
+### Identity / parallel verification
+- Physical-card OCR remains the first source for card-number candidates.
+- Trusted sources establish exact year, set, subject, and card number.
+- Parallel/variation is now a separate evidence gate.
+- Numbered parallels are accepted only when detected serial-number evidence maps uniquely to a documented parallel denominator.
+- Conflicting parallels fail closed instead of being guessed.
+- Per-field confidence and an evidence graph are returned with each analysis.
+- Matching reference-image URLs are retained for future card-template comparison.
 
-## Prior v3 architecture preserved
- The Card Lab 3.0 identity, condition, market filtering, identity-lock, `/market`, and grading-support architecture is preserved.
-
-- Added explicit eBay environment handling.
-- Sandbox is the default and is explicitly set with `EBAY_ENV=sandbox` in `wrangler.jsonc`.
-- Sandbox OAuth and Browse requests use `https://api.sandbox.ebay.com`.
-- Production OAuth and Browse requests use `https://api.ebay.com` when `EBAY_ENV=production`.
-- eBay OAuth token caching is keyed by environment + Client ID, preventing a token from one environment being reused for the other.
-- `/health` now reports `ebayEnvironment` in addition to whether eBay credentials are configured.
-- Market responses include the active eBay environment when the official Browse API is used.
-
-### Identity
-- Google Cloud Vision OCR/Web Detection extracts visual/text clues.
-- Tavily searches trusted card sources/checklists.
-- Deterministic verification gates decide whether identity is `verified`, `probable`, or `unverified`.
-- Saved verified identity can be sent as `identityLock`, so normal re-analysis skips repeat identification.
-
-### Condition / centering / grading
-- Cloudflare Workers AI Moondream 3.1 inspects visible physical condition.
-- The frontend measures centering locally and cross-checks it against vision evidence.
-- Final PSA/BGS/CGC/SGC estimates are calculated in the frontend and withheld when evidence is insufficient.
+### Condition
+- Google Gemma 4 vision is now the primary visible-condition model.
+- Moondream 3.1 is used only as a targeted fallback/consensus pass when the primary result is incomplete, low-confidence, or defect-sensitive.
+- When both models run, Card Lab keeps the more conservative supported score and withholds categories with major disagreement.
+- Photo-quality information from the phone participates in deterministic condition-confidence calibration.
+- Condition model path and stage timing are exposed in diagnostics.
 
 ### Market
-- `POST /market` refreshes market data without re-running identity, condition, centering, or grading.
-- Official eBay Browse API uses keyword + image matching when eBay credentials are configured.
-- Results are filtered against the verified identity and separated into raw vs graded listings.
-- Low / median / high asking-price summaries are calculated from accepted matches.
-- Tavily remains a clearly labeled non-live fallback if official eBay data is unavailable.
+- Official eBay Browse API remains isolated behind `POST /market`.
+- Asking-price statistics now use listing price + stated shipping where available.
+- A trimmed raw-card value and credible low/high range reduce outlier distortion.
+- Market support quality and sample size are returned with the value.
+
+### Regression protection
+- New authenticated `GET /selftest` runs deterministic regression checks for:
+  - valid card-code acceptance
+  - product/URL-slug rejection
+  - serial-to-parallel resolution
+  - fail-closed parallel conflicts
+  - outlier-resistant market value
+  - conservative condition consensus
 
 ## Cloudflare configuration
 Binding / variables:
 - Workers AI binding: `AI`
 - `ALLOWED_ORIGIN=https://darknight909.github.io`
-- `EBAY_ENV=sandbox` for the current Sandbox test phase
+- `EBAY_ENV=sandbox` during the current eBay Sandbox phase
 
 Secrets:
 - `CARDLAB_API_KEY`
 - `GOOGLE_VISION_API_KEY`
 - `TAVILY_API_KEY`
-- `EBAY_CLIENT_ID` = current eBay environment App ID / Client ID
-- `EBAY_CLIENT_SECRET` = current eBay environment Cert ID / Client Secret
-
-Do not store the eBay Client Secret in the frontend or commit it to GitHub.
+- `EBAY_CLIENT_ID`
+- `EBAY_CLIENT_SECRET`
 
 ## Endpoints
 - `GET /health`
+- `GET /selftest` (requires Card Lab bearer key)
 - `POST /analyze`
 - `POST /market`
 
@@ -65,11 +59,7 @@ Replace these three files in the existing `card-lab-api` GitHub repository and c
 - `wrangler.jsonc`
 - `README.md`
 
-Do not rename the Worker/repository configuration. The existing Cloudflare Git deployment should deploy to the already configured Card Lab Worker.
+After deployment, Card Lab → Settings → Test connection should report API `v4.0.0`.
+Then use Settings → Diagnostic mode → Run regression self-test. All tests should pass before analyzing cards.
 
-After deployment, Card Lab → Settings → Test connection should report:
-- API `v3.0.1`
-- eBay configured: true
-- eBay environment: `sandbox`
-
-When eBay Production Browse access is approved, change `EBAY_ENV` to `production` and replace the Cloudflare `EBAY_CLIENT_ID` / `EBAY_CLIENT_SECRET` secrets with the Production App ID / Cert ID. No Card Lab frontend rewrite should be required for that environment switch.
+When eBay Production Browse access is approved, change `EBAY_ENV` to `production` and replace the eBay Sandbox secrets with the Production App ID / Cert ID.

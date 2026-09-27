@@ -1,6 +1,7 @@
-const VERSION = '3.0.2';
+const VERSION = '4.0.0';
 const DEFAULT_ORIGIN = 'https://darknight909.github.io';
-const CONDITION_MODEL = '@cf/moondream/moondream3.1-9B-A2B';
+const CONDITION_PRIMARY_MODEL = '@cf/google/gemma-4-26b-a4b-it';
+const CONDITION_FALLBACK_MODEL = '@cf/moondream/moondream3.1-9B-A2B';
 const TEXT_MODEL = '@cf/meta/llama-3.3-70b-instruct-fp8-fast';
 const GOOGLE_VISION_URL = 'https://vision.googleapis.com/v1/images:annotate';
 const TRUSTED_CARD_DOMAINS = [
@@ -29,6 +30,13 @@ function ebayApiBase(env) {
     : 'https://api.sandbox.ebay.com';
 }
 
+function nowMs(){ return Date.now(); }
+function cleanMs(v){ return Math.max(0, Math.round(Number(v)||0)); }
+function qualityScore(q){
+  const n=Number(q?.score);
+  return Number.isFinite(n)?clamp(n,0,100):null;
+}
+
 export default {
   async fetch(request, env) {
     const origin = request.headers.get('Origin') || '';
@@ -48,7 +56,9 @@ export default {
         ebayConfigured: Boolean(env.EBAY_CLIENT_ID && env.EBAY_CLIENT_SECRET),
         ebayEnvironment: ebayEnvironment(env),
         workersAIConfigured: Boolean(env.AI),
-        architecture: 'verified-source identity + condition + live market',
+        conditionPrimaryModel: CONDITION_PRIMARY_MODEL,
+        conditionFallbackModel: CONDITION_FALLBACK_MODEL,
+        architecture: 'evidence-gated identity + targeted multimodal condition consensus + live market',
       }, 200, cors);
     }
 
@@ -57,13 +67,19 @@ export default {
     if ((request.headers.get('Authorization') || '') !== `Bearer ${env.CARDLAB_API_KEY}`) return json({ ok: false, error: 'Unauthorized' }, 401, cors);
 
     try {
+      if (url.pathname === '/selftest' && request.method === 'GET') {
+        const result=runSelfTests();
+        return json({ok:result.ok,version:VERSION,selftest:result},result.ok?200:500,cors);
+      }
+
       if (url.pathname === '/market' && request.method === 'POST') {
         const body = await request.json();
         const identity = sanitizeLockedIdentity(body.identity);
         if (!identity) throw new Error('A verified card identity is required to refresh market listings.');
         const front = typeof body.front === 'string' && /^data:image\/(jpeg|jpg|png|webp);base64,/i.test(body.front) ? body.front : null;
+        const started=nowMs();
         const market = await getMarket(env, identity, front);
-        return json({ ok:true, version:VERSION, market, ebay:market.ebay || null }, 200, cors);
+        return json({ ok:true, version:VERSION, market, ebay:market.ebay || null, diagnostics:{timingsMs:{market:cleanMs(nowMs()-started)}} }, 200, cors);
       }
 
       if (url.pathname !== '/analyze' || request.method !== 'POST') return json({ ok: false, error: 'Not found' }, 404, cors);
@@ -73,15 +89,28 @@ export default {
       const front = validateImage(body.front, 'front');
       const back = validateImage(body.back, 'back');
       const lockedIdentity = sanitizeLockedIdentity(body.identityLock);
+      const requestStarted = nowMs();
+      const conditionStarted = nowMs();
+      let conditionDurationMs = 0;
+      let identityDurationMs = 0;
+      let marketDurationMs = 0;
+      const photoQuality = {
+        front: qualityScore(body?.photoQuality?.front),
+        back: qualityScore(body?.photoQuality?.back),
+      };
 
       const conditionPromise = Promise.all([
-        inspectConditionSide(env, 'front', front),
-        inspectConditionSide(env, 'back', back),
-      ]).then(([frontCondition, backCondition]) => combineCondition(frontCondition, backCondition));
+        inspectConditionSide(env, 'front', front, photoQuality.front),
+        inspectConditionSide(env, 'back', back, photoQuality.back),
+      ]).then(([frontCondition, backCondition]) => {
+        conditionDurationMs = nowMs() - conditionStarted;
+        return combineCondition(frontCondition, backCondition, photoQuality);
+      });
 
       let google = null;
       let webLookup = { configured:Boolean(env.TAVILY_API_KEY), used:false, query:'', queries:[], results:[], answer:null };
       let identityResult;
+      const identityStarted = nowMs();
 
       if (lockedIdentity) {
         identityResult = {
@@ -94,6 +123,10 @@ export default {
           review_reason: null,
           selected_card_code: lockedIdentity.cardNo || null,
           serial_number: clean(body.serialNumber),
+          variant_status: lockedIdentity.variation ? 'locked' : 'not-established',
+          field_confidence:{cardNo:99,subject:99,year:99,set:99,variation:lockedIdentity.variation?99:40,serialNumber:body.serialNumber?95:0},
+          evidence_graph:{locked:{value:true,note:'Previously verified identity reused without re-querying identity sources.'}},
+          reference_images:Array.isArray(body.referenceImages)?body.referenceImages.slice(0,8):[],
         };
       } else {
         const googleInitial = await googleVisionInitial(env, front, back);
@@ -112,8 +145,9 @@ export default {
           }
         }
 
-        identityResult = await resolveIdentityFromSources(env, google, provisional, webLookup);
+        identityResult = await resolveIdentityFromSources(env, google, provisional, webLookup, front, back);
       }
+      identityDurationMs = nowMs() - identityStarted;
 
       const condition = await conditionPromise;
       const analysis = {
@@ -128,13 +162,19 @@ export default {
         serial_number: identityResult.serial_number || null,
         needs_review: Boolean(identityResult.needs_review),
         review_reason: identityResult.review_reason || null,
+        variant_status: identityResult.variant_status || 'unknown',
+        field_confidence: identityResult.field_confidence || {},
+        evidence_graph: identityResult.evidence_graph || {},
+        reference_images: identityResult.reference_images || [],
       };
 
       let market = emptyMarket(analysis.identity);
+      const marketStarted = nowMs();
       if (identityMarketReady(analysis)) {
         try { market = await getMarket(env, analysis.identity, front); }
         catch (e) { market = { ...emptyMarket(analysis.identity), error:cleanError(e) }; }
       }
+      marketDurationMs = nowMs() - marketStarted;
 
       return json({
         ok: true,
@@ -151,11 +191,25 @@ export default {
           results: (webLookup.results || []).slice(0, 10).map(x => ({ title:x.title, url:x.url, score:x.score, trustTier:x.trustTier, exactCode:x.exactCode })),
         },
         pipeline: {
-          identity: lockedIdentity ? 'Verified identity lock reused' : 'Google OCR/Web Detection → trusted-source exact-card verification',
-          condition: 'Cloudflare Workers AI visible-condition inspection with structured parsing, retry, and conservative text-only normalization on malformed output',
-          centering: 'Measured locally; vision cross-check is used only as a disagreement guard',
+          identity: lockedIdentity ? 'Verified identity lock reused' : 'Google OCR/Web Detection → trusted-source exact-card verification → variant/serial evidence gate',
+          condition: 'Gemma 4 vision primary → targeted Moondream consensus/fallback only when needed',
+          centering: 'Measured locally; independent vision cross-check is used as a disagreement guard',
           grading: 'Calculated locally from published grading standards/guidelines',
           market: market.live ? 'Official eBay Browse API keyword/image matching' : 'Web-indexed fallback until eBay API credentials are connected',
+        },
+        diagnostics: {
+          timingsMs: {
+            identity: cleanMs(identityDurationMs),
+            condition: cleanMs(conditionDurationMs),
+            market: cleanMs(marketDurationMs),
+            total: cleanMs(nowMs()-requestStarted),
+          },
+          conditionModels: {
+            front: condition?.sides?.front?.modelPath || null,
+            back: condition?.sides?.back?.modelPath || null,
+          },
+          photoQuality,
+          variantStatus: analysis.variant_status,
         },
         privacy: 'Front/back images are sent transiently to Google Cloud Vision and Cloudflare Workers AI. If eBay API image search is configured, the front analysis image is also sent to eBay Browse API. Tavily receives text/search clues, not card images. This Worker does not persist images or collection data.',
       }, 200, cors);
@@ -468,7 +522,13 @@ function collectGooglePages(g) {
       const key = p.url || p.title;
       if (!key || seen.has(key)) continue;
       seen.add(key);
-      pages.push({ side, title:p.title, url:p.url, fullMatches:(p.fullMatchingImages||[]).length, partialMatches:(p.partialMatchingImages||[]).length, trustTier:domainTrust(p.url) });
+      pages.push({
+        side,title:p.title,url:p.url,
+        fullMatches:(p.fullMatchingImages||[]).length,
+        partialMatches:(p.partialMatchingImages||[]).length,
+        trustTier:domainTrust(p.url),
+        referenceImages:[...(p.fullMatchingImages||[]),...(p.partialMatchingImages||[])].filter(Boolean).slice(0,4),
+      });
     }
   }
   return pages.slice(0, 24);
@@ -612,7 +672,107 @@ function separateSetAndVariation(setName, variation, evidenceTexts, serialNumber
   return {set,variation:v};
 }
 
-async function resolveIdentityFromSources(env, google, provisional, webLookup) {
+
+function canonicalParallelName(word){
+  if(!word)return null;
+  return String(word).trim().replace(/\b\w/g,m=>m.toUpperCase()).replace('X-Fractor','X-Fractor').replace('Xfractor','X-Fractor');
+}
+function parallelNamesInText(text){
+  const t=normalizeTitle(text);
+  const found=[];
+  for(const w of [...PARALLEL_WORDS].sort((a,b)=>b.length-a.length)){
+    if(['parallel','variation'].includes(String(w).toLowerCase()))continue;
+    const n=normalizeTitle(w);
+    if(n && new RegExp(`(?:^|\\s)${escapeRegex(n)}(?:\\s|$)`,'i').test(t))found.push(canonicalParallelName(w));
+  }
+  return [...new Set(found)];
+}
+function denominatorNearParallel(text, parallel){
+  const raw=String(text||'');
+  const idx=raw.toLowerCase().indexOf(String(parallel||'').toLowerCase());
+  if(idx<0)return null;
+  const ctx=raw.slice(Math.max(0,idx-70),Math.min(raw.length,idx+String(parallel).length+90));
+  const m=ctx.match(/(?:\/|out of\s+)(\d{1,5})\b/i);
+  return m?Number(m[1]):null;
+}
+function buildVariantCatalog(sources, pages){
+  const byName=new Map();
+  const feed=(text,weight,source)=>{
+    for(const name of parallelNamesInText(text)){
+      const key=name.toLowerCase();
+      const old=byName.get(key)||{name,weight:0,denominators:new Set(),sources:[]};
+      old.weight+=weight;
+      const d=denominatorNearParallel(text,name);
+      if(Number.isFinite(d))old.denominators.add(d);
+      if(source)old.sources.push(source);
+      byName.set(key,old);
+    }
+  };
+  for(const x of sources||[])feed(`${x.title||''} ${x.content||''}`,x.trustTier>=4?5:x.trustTier===3?4:2,x.url||x.domain);
+  for(const p of pages||[])feed(p.title||'',p.fullMatches?6:p.partialMatches?3:1,p.url);
+  return [...byName.values()].map(x=>({...x,denominators:[...x.denominators]})).sort((a,b)=>b.weight-a.weight);
+}
+function serialDenominator(serial){
+  const m=String(serial||'').match(/\/\s*(\d{1,5})\b/);
+  return m?Number(m[1]):null;
+}
+function resolveVariantEvidence(parsedVariation, serialNumber, sources, pages){
+  const catalog=buildVariantCatalog(sources,pages);
+  const denom=serialDenominator(serialNumber);
+  const parsed=clean(parsedVariation);
+  const conflicts=catalog.filter(x=>x.weight>=4);
+  let variation=null,status='unknown',reason=null,matched=null;
+
+  if(denom){
+    const matches=catalog.filter(x=>x.denominators.includes(denom));
+    if(matches.length===1){
+      matched=matches[0];
+      variation=`${matched.name} /${denom}`;
+      status='verified';
+    }else if(matches.length>1){
+      status='unresolved';
+      reason=`Serial denominator /${denom} maps to more than one documented parallel.`;
+    }else if(parsed){
+      const p=catalog.find(x=>normalizeTitle(x.name)===normalizeTitle(parsed.replace(/\/\d+.*/,'')));
+      if(p && p.denominators.length && !p.denominators.includes(denom)){
+        status='unresolved';
+        reason=`Detected serial ${serialNumber} conflicts with the documented ${p.name} numbering.`;
+      }else{
+        status='unresolved';
+        reason=`Serial ${serialNumber} was detected, but trusted sources did not map /${denom} to one unique parallel.`;
+      }
+    }else{
+      status='unresolved';
+      reason=`Serial ${serialNumber} was detected, but its parallel could not be mapped uniquely.`;
+    }
+  }else if(parsed){
+    const pnames=parallelNamesInText(parsed);
+    const p=pnames.length?catalog.find(x=>normalizeTitle(x.name)===normalizeTitle(pnames[0])):null;
+    const strongDistinct=conflicts.map(x=>x.name);
+    if(strongDistinct.length>1){
+      status='unresolved';
+      reason=`Trusted sources show multiple possible parallels (${strongDistinct.slice(0,4).join(', ')}), but no serial-number evidence confirms one.`;
+    }else if(p && p.denominators.length){
+      status='unresolved';
+      reason=`${p.name} is documented as numbered /${p.denominators.join(' or /')}; serial-number evidence is required before accepting it.`;
+    }else if(p && p.weight>=6){
+      variation=p.name;
+      status='probable';
+      matched=p;
+    }else{
+      status='unresolved';
+      reason='A parallel was suggested visually/textually but lacked enough independent evidence.';
+    }
+  }else if(conflicts.length>1){
+    status='unresolved';
+    reason=`Multiple documented parallels exist for this exact card (${conflicts.slice(0,4).map(x=>x.name).join(', ')}); Card Lab will not guess which one is pictured.`;
+  }else{
+    status='not-established';
+  }
+  return {variation,status,reason,catalog:catalog.slice(0,12),matched};
+}
+
+async function resolveIdentityFromSources(env, google, provisional, webLookup, frontImage=null, backImage=null) {
   const candidates=(provisional.cardCandidates||[]).slice(0,5);
   const trusted=(webLookup?.results||[]).map(x=>sourceEvidence(x,provisional.cardNo));
   const pages=collectGooglePages(google);
@@ -690,10 +850,12 @@ RETURN:
   const split=separateSetAndVariation(identity.set,identity.variation,[...sourceTexts,...exactGooglePages.map(p=>p.title||'')],provisional.serialNumber);
   identity.set=split.set;
   identity.variation=split.variation;
+  const variantResolution=resolveVariantEvidence(identity.variation,provisional.serialNumber,exactSources,exactGooglePages);
+  identity.variation=variantResolution.variation;
   if (identity.subject && !sourceTexts.some(t=>containsSubject(t,identity.subject))) identity.subject=null;
   if (identity.year && !sourceTexts.some(t=>new RegExp(`\\b${identity.year}\\b`).test(t))) identity.year=null;
   if (identity.set && !sourceTexts.some(t=>containsSet(t,identity.set))) identity.set=null;
-  if (identity.variation && !sourceTexts.some(t=>containsVariation(t,identity.variation)) && !exactGooglePages.some(p=>containsVariation(p.title||'',identity.variation))) identity.variation=null;
+  if (identity.variation && variantResolution.status!=='verified' && variantResolution.status!=='probable') identity.variation=null;
 
   const uniqueStrongDomains=new Set(exactSources.filter(x=>x.trustTier>=3).map(x=>x.domain));
   const officialCount=exactSources.filter(x=>x.trustTier===4).length;
@@ -707,6 +869,7 @@ RETURN:
   let verification_status='unverified';
   if (codeSupported && subjectSupported && yearSupported && setSupported && (uniqueStrongDomains.size>=2 || (officialCount>=1 && strongCount>=1))) verification_status='verified';
   else if (codeSupported && subjectSupported && setSupported && strongCount>=1) verification_status='probable';
+  if (variantResolution.status==='unresolved' && verification_status==='verified') verification_status='probable';
 
   let confidence=20;
   if (codeSupported) confidence+=30;
@@ -720,6 +883,8 @@ RETURN:
   if (verification_status==='unverified') confidence=Math.min(confidence,69);
   if (verification_status==='probable') confidence=Math.min(confidence,84);
   if (verification_status==='verified') confidence=Math.max(confidence,90);
+  if (variantResolution.status==='verified') confidence+=3;
+  if (variantResolution.status==='unresolved') confidence=Math.min(confidence,84);
   confidence=clamp(Math.round(confidence),0,99);
 
   const sources=exactSources.slice(0,10).map(x=>({title:x.title,url:x.url,domain:x.domain,trustTier:x.trustTier,exactCardCode:true}));
@@ -730,10 +895,31 @@ RETURN:
   if (setSupported) evidence.push(`Set/insert identity is supported by the trusted exact-card sources.`);
   if (uniqueStrongDomains.size>=2) evidence.push(`${uniqueStrongDomains.size} independent established source domains agree on the exact card.`);
   if (provisional.serialNumber) evidence.push(`Serial-number text detected on the card: ${provisional.serialNumber}.`);
+  if (variantResolution.status==='verified') evidence.push(`Parallel ${identity.variation} was tied to the detected serial denominator by trusted-source evidence.`);
+  if (variantResolution.status==='unresolved') evidence.push('Parallel/variation was intentionally withheld because the evidence conflicts or is incomplete.');
 
   let reviewReason=null;
   if (verification_status==='unverified') reviewReason='Exact identity could not be established from trusted online sources.';
+  else if (variantResolution.status==='unresolved') reviewReason=variantResolution.reason||'Parallel/variation needs additional evidence.';
   else if (verification_status==='probable') reviewReason='Only one strong trusted-source path confirmed the exact card; additional corroboration is recommended.';
+
+  const field_confidence={
+    cardNo:codeSupported?clamp(88+uniqueStrongDomains.size*4,0,99):35,
+    subject:subjectSupported?clamp(84+uniqueStrongDomains.size*4,0,99):35,
+    year:yearSupported?clamp(82+uniqueStrongDomains.size*4,0,99):35,
+    set:setSupported?clamp(80+uniqueStrongDomains.size*4,0,99):35,
+    variation:variantResolution.status==='verified'?96:variantResolution.status==='probable'?78:variantResolution.status==='unresolved'?20:(identity.variation?55:40),
+    serialNumber:provisional.serialNumber?92:0,
+  };
+  const evidence_graph={
+    cardNo:{value:identity.cardNo,supportingDomains:[...new Set(exactSources.filter(x=>exactTokenPresent(`${x.title||''} ${x.content||''}`,identity.cardNo)).map(x=>x.domain))]},
+    subject:{value:identity.subject,supportingDomains:[...new Set(exactSources.filter(x=>containsSubject(`${x.title||''} ${x.content||''}`,identity.subject)).map(x=>x.domain))]},
+    year:{value:identity.year,supportingDomains:[...new Set(exactSources.filter(x=>identity.year&&new RegExp(`\\b${identity.year}\\b`).test(`${x.title||''} ${x.content||''}`)).map(x=>x.domain))]},
+    set:{value:identity.set,supportingDomains:[...new Set(exactSources.filter(x=>containsSet(`${x.title||''} ${x.content||''}`,identity.set)).map(x=>x.domain))]},
+    variation:{value:identity.variation,status:variantResolution.status,reason:variantResolution.reason,candidates:variantResolution.catalog.map(x=>({name:x.name,denominators:x.denominators,weight:x.weight}))},
+    serialNumber:{value:provisional.serialNumber,source:provisional.serialNumber?'physical-card OCR':null},
+  };
+  const reference_images=[...new Set(exactGooglePages.flatMap(p=>p.referenceImages||[]).filter(Boolean))].slice(0,8);
 
   return {
     identity,
@@ -745,6 +931,10 @@ RETURN:
     review_reason:reviewReason,
     selected_card_code:selectedCode,
     serial_number:provisional.serialNumber,
+    variant_status:variantResolution.status,
+    field_confidence,
+    evidence_graph,
+    reference_images,
   };
 }
 
@@ -795,73 +985,132 @@ function sanitizeLockedIdentity(obj) {
 
 function identityMarketReady(analysis) {
   const i=analysis?.identity||{};
-  return Boolean(i.year && i.set && i.subject && i.cardNo && ['verified','locked'].includes(analysis?.verification_status));
+  return Boolean(i.year && i.set && i.subject && i.cardNo &&
+    ['verified','locked'].includes(analysis?.verification_status) &&
+    analysis?.variant_status!=='unresolved');
 }
 
 
-async function inspectConditionSide(env, side, image) {
-  const primaryQuestion = `Inspect ONLY the visible physical condition of the ${side} of one raw trading card.
-Do not identify the card. Do not invent defects. If something cannot be judged, return null.
+async function runConditionPrimary(env, side, image, question) {
+  const raw=await env.AI.run(CONDITION_PRIMARY_MODEL,{
+    messages:[
+      {role:'system',content:'You are a conservative trading-card condition inspector. Use only visible evidence from the supplied image.'},
+      {role:'user',content:question},
+    ],
+    image,
+    temperature:0,
+    max_tokens:900,
+    stream:false,
+  });
+  return {text:modelText(raw),model:CONDITION_PRIMARY_MODEL};
+}
 
-Return ONLY a JSON object with exactly these keys:
+async function runConditionFallback(env, side, image, question) {
+  const raw=await env.AI.run(CONDITION_FALLBACK_MODEL,{
+    task:'query',image,question,reasoning:false,temperature:0,max_tokens:850,stream:false,
+  });
+  return {text:modelText(raw),model:CONDITION_FALLBACK_MODEL};
+}
+
+function conditionNeedsConsensus(x) {
+  if(conditionCompleteness(x)<4)return true;
+  if(Number(x?.confidence||0)<35)return true;
+  if(['corners','edges','surface','focus'].some(k=>Number.isFinite(Number(x?.[k]))&&Number(x[k])<8.5))return true;
+  if(Object.values(x?.defects||{}).some(Boolean))return true;
+  return false;
+}
+
+function calibrateConditionConfidence(x, photoQuality, agreement=null) {
+  const complete=conditionCompleteness(x);
+  if(complete<4)return Math.min(30,Number(x?.confidence||0));
+  const q=Number.isFinite(Number(photoQuality))?clamp(Number(photoQuality),0,100):70;
+  const model=clamp(Number(x?.confidence||0),0,100);
+  let conf=44 + q*.34 + model*.16;
+  if(Number.isFinite(agreement))conf += clamp((1.6-agreement)*10,-18,10);
+  if(!(x?.notes||[]).length)conf-=6;
+  return clamp(Math.round(conf),35,94);
+}
+
+function mergeConditionConsensus(a,b,side,photoQuality) {
+  const out={side,defects:{},notes:[]};
+  let diffSum=0,diffN=0,conflicts=0;
+  for(const k of ['corners','edges','surface','focus']){
+    const av=Number(a?.[k]),bv=Number(b?.[k]);
+    if(Number.isFinite(av)&&Number.isFinite(bv)){
+      const d=Math.abs(av-bv);diffSum+=d;diffN++;
+      if(d>2){out[k]=null;conflicts++}
+      else out[k]=clampHalf(Math.min(av,bv),1,10);
+    }else out[k]=Number.isFinite(av)?av:Number.isFinite(bv)?bv:null;
+  }
+  for(const k of ['crease','dent','stain','scratch','printline','mark','possible_alteration'])out.defects[k]=Boolean(a?.defects?.[k]||b?.defects?.[k]);
+  const agreement=diffN?diffSum/diffN:null;
+  const centA=a?.centering,centB=b?.centering;
+  const pairClose=(p,q)=>Array.isArray(p)&&Array.isArray(q)&&Math.abs(Math.max(...p)-Math.max(...q))<=7;
+  out.centering={
+    lr:pairClose(centA?.lr,centB?.lr)?centA.lr:null,
+    tb:pairClose(centA?.tb,centB?.tb)?centA.tb:null,
+    confidence:pairClose(centA?.lr,centB?.lr)&&pairClose(centA?.tb,centB?.tb)?Math.min(Number(centA?.confidence||0),Number(centB?.confidence||0)):0,
+  };
+  out.notes=Array.from(new Set([...(a?.notes||[]),...(b?.notes||[]),conflicts?'One or more condition categories were withheld because the two vision passes disagreed materially.':null].filter(Boolean))).slice(0,8);
+  out.confidence=calibrateConditionConfidence(out,photoQuality,agreement);
+  if(conflicts)out.confidence=Math.min(out.confidence,68);
+  out.modelPath='Gemma 4 + Moondream consensus';
+  out.agreement=agreement==null?null:+agreement.toFixed(2);
+  return out;
+}
+
+async function inspectConditionSide(env, side, image, photoQuality=null) {
+  const question = `Inspect ONLY the visible physical condition of the ${side} of one raw trading card.
+Do not identify the card. Do not infer defects that are not visible. If something cannot be judged, return null.
+
+Return ONLY one JSON object:
 {"corners":number|null,"edges":number|null,"surface":number|null,"focus":number|null,"defects":["crease"|"dent"|"stain"|"scratch"|"printline"|"mark"|"possible_alteration"],"confidence":number,"center_lr":"55/45"|null,"center_tb":"52/48"|null,"center_confidence":number,"notes":["short visible evidence"]}
 
-Scores use 1-10 in 0.5 increments. Scores below 7 require a clearly visible named defect.
-FOCUS means print/focus/registration quality on the card, not camera sharpness.
-Centering is printed-design centering only and must be null unless a clear printed border/design frame can be distinguished from the physical card edge.`;
+Scores use 1-10 in 0.5 increments:
+10=no visible defect at this image resolution; 9-9.5=minute issue; 8-8.5=minor visible issue; 7-7.5=moderate visible issue. Below 7 requires a clearly visible named defect.
+FOCUS means card print/focus/registration, not camera sharpness.
+Centering is printed-design centering only and must be null unless a real printed border/design frame is clearly distinguishable from artwork.`;
 
-  const fallbackQuestion = `Inspect the visible physical condition of this ${side} raw trading card only. Return ONLY KEY=VALUE lines:
-CORNERS=
-EDGES=
-SURFACE=
-FOCUS=
-DEFECTS=
-CONFIDENCE=
-CENTER_LR=
-CENTER_TB=
-CENTER_CONFIDENCE=
-NOTES=
-Use 1-10 scores in 0.5 increments or UNKNOWN. DEFECTS is NONE or crease,dent,stain,scratch,printline,mark,possible_alteration. Use UNKNOWN when uncertain.`;
-
-  try {
-    const raw = await env.AI.run(CONDITION_MODEL, {
-      task:'query', image, question:primaryQuestion, reasoning:false, temperature:0, max_tokens:1000, stream:false,
-    });
-    const primaryText=modelText(raw);
-    let parsed=parseConditionFlexible(primaryText,side);
-    if (conditionCompleteness(parsed) >= 4 && parsed.confidence >= 30) {
-      parsed.diagnostic='primary-structured';
-      return parsed;
-    }
-
-    const retry = await env.AI.run(CONDITION_MODEL, {
-      task:'query', image, question:fallbackQuestion, reasoning:false, temperature:0, max_tokens:800, stream:false,
-    });
-    const retryText=modelText(retry);
-    const second=parseConditionFlexible(retryText,side);
-    if (conditionCompleteness(second) > conditionCompleteness(parsed) || second.confidence > parsed.confidence) parsed=second;
-    if (conditionCompleteness(parsed) >= 4 && parsed.confidence >= 30) {
-      parsed.notes.unshift('Condition model required one automatic retry for a complete response.');
-      parsed.diagnostic='retry-flexible';
-      return parsed;
-    }
-
-    // Last-resort structure repair: the text model may only normalize values the
-    // vision model explicitly stated. It is not allowed to add a visual judgment.
-    const sourceText=[primaryText,retryText].filter(Boolean).join('\n---RETRY---\n').slice(0,7000);
-    if (sourceText && env.AI) {
-      const repaired=await normalizeConditionOutput(env,side,sourceText);
-      if (conditionCompleteness(repaired) > conditionCompleteness(parsed) || repaired.confidence > parsed.confidence) parsed=repaired;
-    }
-    parsed.diagnostic=conditionCompleteness(parsed)>=4?'text-normalized':'insufficient-model-output';
-    if (conditionCompleteness(parsed)<4) {
-      parsed.confidence=Math.min(parsed.confidence||0,25);
-      parsed.notes.push('Automatic condition scores withheld because the vision response did not contain all required measurable fields.');
-    }
-    return parsed;
-  } catch (e) {
-    return unknownConditionSide(side, `Condition model unavailable: ${cleanError(e)}`);
+  let primary=null;
+  try{
+    const r=await runConditionPrimary(env,side,image,question);
+    primary=parseConditionFlexible(r.text,side);
+    primary.modelPath='Gemma 4';
+  }catch(e){
+    console.warn('Primary condition model:',e);
   }
+
+  if(primary && !conditionNeedsConsensus(primary)){
+    primary.confidence=calibrateConditionConfidence(primary,photoQuality,null);
+    primary.modelPath='Gemma 4';
+    return primary;
+  }
+
+  let fallback=null;
+  try{
+    const r=await runConditionFallback(env,side,image,question);
+    fallback=parseConditionFlexible(r.text,side);
+    fallback.modelPath='Moondream 3.1';
+  }catch(e){
+    console.warn('Fallback condition model:',e);
+  }
+
+  if(primary && fallback && conditionCompleteness(primary)>=3 && conditionCompleteness(fallback)>=3){
+    return mergeConditionConsensus(primary,fallback,side,photoQuality);
+  }
+
+  const best=[primary,fallback].filter(Boolean).sort((a,b)=>conditionCompleteness(b)-conditionCompleteness(a)||Number(b.confidence||0)-Number(a.confidence||0))[0];
+  if(best){
+    best.confidence=calibrateConditionConfidence(best,photoQuality,null);
+    best.modelPath=best.modelPath||'single vision model';
+    if(conditionCompleteness(best)<4){
+      best.confidence=Math.min(best.confidence,30);
+      best.notes.push('Automatic condition score withheld where the available vision output was incomplete.');
+    }
+    return best;
+  }
+
+  return unknownConditionSide(side,'Both condition-vision paths were unavailable.');
 }
 
 function parseConditionFlexible(text, side) {
@@ -1000,23 +1249,28 @@ function unknownConditionSide(side, note) {
   };
 }
 
-function combineCondition(front, back) {
+function combineCondition(front, back, photoQuality={}) {
   const worse = k => {
     const vals=[front?.[k],back?.[k]].map(Number).filter(Number.isFinite);
     return vals.length===2?clampHalf(Math.min(...vals),1,10):null;
   };
   const defects={};
-  for (const k of ['crease','dent','stain','scratch','printline','mark','possible_alteration']) defects[k]=Boolean(front?.defects?.[k]||back?.defects?.[k]);
+  for(const k of ['crease','dent','stain','scratch','printline','mark','possible_alteration'])defects[k]=Boolean(front?.defects?.[k]||back?.defects?.[k]);
   const confs=[front?.confidence,back?.confidence].map(Number).filter(Number.isFinite);
-  let confidence=confs.length===2?Math.round((confs[0]+confs[1])/2):0;
+  let confidence=confs.length===2?Math.round(Math.min(...confs)*.65 + ((confs[0]+confs[1])/2)*.35):0;
   const scores=['corners','edges','surface','focus'].map(worse);
-  if (scores.some(v=>!Number.isFinite(v))) confidence=Math.min(confidence,40);
+  if(scores.some(v=>!Number.isFinite(v)))confidence=Math.min(confidence,40);
   return {
     corners:worse('corners'),edges:worse('edges'),surface:worse('surface'),focus:worse('focus'),
     defects,
-    confidence:clamp(confidence,0,95),
-    notes:Array.from(new Set([...(front?.notes||[]).map(x=>`Front: ${x}`),...(back?.notes||[]).map(x=>`Back: ${x}`),'Condition combines the worse visible front/back result; microscopic or hidden defects cannot be ruled out from phone photos.'])).slice(0,10),
+    confidence:clamp(confidence,0,94),
+    notes:Array.from(new Set([
+      ...(front?.notes||[]).map(x=>`Front: ${x}`),
+      ...(back?.notes||[]).map(x=>`Back: ${x}`),
+      'Condition combines the worse supported front/back result; microscopic or hidden defects still require in-hand inspection.'
+    ])).slice(0,12),
     sides:{front,back},
+    photoQuality,
   };
 }
 
@@ -1226,12 +1480,34 @@ function combineEbayResults(identity, keywordItems, imageItems) {
 }
 
 function marketStats(items) {
-  const vals=(items||[]).map(x=>Number(x.price)).filter(v=>Number.isFinite(v)&&v>=0);
-  if (!vals.length) return null;
+  const vals=(items||[]).map(x=>{
+    const p=Number(x.price),ship=Number(x.shipping);
+    if(!Number.isFinite(p)||p<0)return null;
+    return p+(Number.isFinite(ship)&&ship>=0?ship:0);
+  }).filter(Number.isFinite);
+  if(!vals.length)return null;
   const sorted=[...vals].sort((a,b)=>a-b);
-  const mid=Math.floor(sorted.length/2);
-  const median=sorted.length%2?sorted[mid]:(sorted[mid-1]+sorted[mid])/2;
-  return {sampleSize:vals.length,low:+sorted[0].toFixed(2),median:+median.toFixed(2),high:+sorted[sorted.length-1].toFixed(2)};
+  const medianOf=a=>{const mid=Math.floor(a.length/2);return a.length%2?a[mid]:(a[mid-1]+a[mid])/2};
+  const median=medianOf(sorted);
+  const trim=sorted.length>=6?Math.max(1,Math.floor(sorted.length*.15)):0;
+  const trimmed=trim?sorted.slice(trim,sorted.length-trim):sorted;
+  const tMedian=medianOf(trimmed);
+  const q1=sorted[Math.floor((sorted.length-1)*.25)],q3=sorted[Math.ceil((sorted.length-1)*.75)];
+  const spread=median>0?(q3-q1)/median:1;
+  let quality=25+Math.min(45,sorted.length*7)-Math.min(35,spread*35);
+  quality=clamp(Math.round(quality),15,95);
+  return {
+    sampleSize:vals.length,
+    low:+sorted[0].toFixed(2),
+    median:+median.toFixed(2),
+    high:+sorted[sorted.length-1].toFixed(2),
+    trimmedLow:+trimmed[0].toFixed(2),
+    trimmedMedian:+tMedian.toFixed(2),
+    trimmedHigh:+trimmed[trimmed.length-1].toFixed(2),
+    value:+tMedian.toFixed(2),
+    quality,
+    includesShipping:true,
+  };
 }
 
 function extractPrice(text) {
@@ -1286,6 +1562,35 @@ async function getEbayToken(env) {
     cacheKey
   };
   return ebayTokenCache.token;
+}
+
+
+function runSelfTests(){
+  const tests=[];
+  const add=(name,pass,details=null)=>tests.push({name,pass:Boolean(pass),details});
+  add('card-code accepts exact alphanumeric code',isPlausibleCardCode('91TF-2')===true);
+  add('card-code rejects product URL slug',isPlausibleCardCode('TOPPS-FLAGSHIP-1991')===false);
+
+  const mockSources=[
+    {title:'2026 Topps Flagship 1991 Topps Football #91TF-2 Travis Hunter Green /99',content:'Green parallel serial numbered /99',trustTier:3,url:'https://beckett.com/mock'},
+    {title:'2026 Topps Flagship 1991 Topps Football #91TF-2 Travis Hunter Orange /25',content:'Orange parallel serial numbered /25',trustTier:3,url:'https://tcdb.com/mock'},
+  ];
+  const serial=resolveVariantEvidence('Orange','23/99',mockSources,[]);
+  add('serial denominator resolves documented parallel',serial.status==='verified'&&serial.variation==='Green /99',serial);
+  const conflict=resolveVariantEvidence('Orange',null,mockSources,[]);
+  add('conflicting numbered parallels fail closed without serial',conflict.status==='unresolved'&&conflict.variation==null,conflict);
+
+  const ms=marketStats([{price:10,shipping:2},{price:11,shipping:2},{price:12,shipping:2},{price:13,shipping:2},{price:14,shipping:2},{price:999,shipping:0}]);
+  add('market outlier does not dominate raw value',Boolean(ms&&ms.value<25&&ms.trimmedHigh<50),ms);
+
+  const merged=mergeConditionConsensus(
+    {corners:9,edges:9,surface:9,focus:9,defects:{},confidence:30,centering:{lr:[52,48],tb:[51,49],confidence:70},notes:['pass A']},
+    {corners:9.5,edges:9,surface:8.5,focus:9,defects:{},confidence:60,centering:{lr:[53,47],tb:[52,48],confidence:65},notes:['pass B']},
+    'front',85
+  );
+  add('condition consensus preserves conservative scores',merged.corners===9&&merged.surface===8.5&&merged.confidence>=60,merged);
+
+  return {ok:tests.every(x=>x.pass),passed:tests.filter(x=>x.pass).length,total:tests.length,tests};
 }
 
 function structuredModelResult(raw,label) {
