@@ -1,9 +1,11 @@
-const VERSION = '4.0.0';
+const VERSION = '5.0.0';
 const DEFAULT_ORIGIN = 'https://darknight909.github.io';
 const CONDITION_PRIMARY_MODEL = '@cf/google/gemma-4-26b-a4b-it';
 const CONDITION_FALLBACK_MODEL = '@cf/moondream/moondream3.1-9B-A2B';
 const TEXT_MODEL = '@cf/meta/llama-3.3-70b-instruct-fp8-fast';
 const GOOGLE_VISION_URL = 'https://vision.googleapis.com/v1/images:annotate';
+const FEATURE_FLAGS = Object.freeze({referenceTemplates:true,stageCaching:true,targetedConditionConsensus:true,serialParallelGate:true,adaptiveMarket:true,strictMarketFiltering:true,localFingerprintHints:true,failClosed:true});
+const PERFORMANCE_BUDGET_MS = Object.freeze({analysis:30000,identity:15000,condition:15000,reference:10000,market:8000});
 const TRUSTED_CARD_DOMAINS = [
   'topps.com','fanaticscollect.com','paniniamerica.net','upperdeck.com','leaftradingcards.com',
   'beckett.com','tcdb.com','cardboardconnection.com','cardboardchecklist.com','sportscardspro.com'
@@ -32,9 +34,48 @@ function ebayApiBase(env) {
 
 function nowMs(){ return Date.now(); }
 function cleanMs(v){ return Math.max(0, Math.round(Number(v)||0)); }
+function budgetStatus(t={}){return {analysis:cleanMs(t.total)>PERFORMANCE_BUDGET_MS.analysis,identity:cleanMs(t.identity)>PERFORMANCE_BUDGET_MS.identity,condition:cleanMs(t.condition)>PERFORMANCE_BUDGET_MS.condition,reference:cleanMs(t.reference)>PERFORMANCE_BUDGET_MS.reference,market:cleanMs(t.market)>PERFORMANCE_BUDGET_MS.market};}
 function qualityScore(q){
   const n=Number(q?.score);
   return Number.isFinite(n)?clamp(n,0,100):null;
+}
+
+function sanitizeTrustedHint(obj) {
+  if (!obj || typeof obj!=='object') return null;
+  const cardNo=clean(obj.cardNo)?.replace(/^#/,'')||null;
+  if (!cardNo || !isPlausibleCardCode(cardNo,true)) return null;
+  return {
+    cardNo,
+    year:validYear(obj.year),
+    brand:normalizeBrand(obj.brand),
+    set:clean(obj.set),
+    subject:clean(obj.subject),
+    variation:clean(obj.variation),
+    source:clean(obj.source)||'local verified-card fingerprint',
+  };
+}
+function applyTrustedHint(provisional,hint) {
+  if (!hint) return provisional;
+  const out={...provisional};
+  out.cardCandidates=Array.isArray(out.cardCandidates)?[...out.cardCandidates]:[];
+  if (!out.cardCandidates.some(x=>normalizeLooseToken(x.value)===normalizeLooseToken(hint.cardNo))) {
+    out.cardCandidates.unshift({value:hint.cardNo,score:138,context:'local verified-card fingerprint hint',origin:'local-hint'});
+  }
+  if (!out.cardNo) out.cardNo=hint.cardNo;
+  if (!out.year && hint.year) out.year=hint.year;
+  if (!out.brand && hint.brand) out.brand=hint.brand;
+  out.trustedHint=hint;
+  return out;
+}
+function sanitizeConditionLock(obj) {
+  if (!obj || typeof obj!=='object') return null;
+  const sides=obj.sides||{};
+  const front=sides.front?sanitizeConditionAssessment(sides.front):null;
+  const back=sides.back?sanitizeConditionAssessment(sides.back):null;
+  const combined=sanitizeConditionAssessment(obj);
+  if (!front || !back || conditionCompleteness(front)<4 || conditionCompleteness(back)<4) return null;
+  if (!combined || conditionCompleteness(combined)<4 || Number(combined.confidence||0)<45) return null;
+  return {...combined,sides:{front,back},reused:true};
 }
 
 export default {
@@ -58,7 +99,9 @@ export default {
         workersAIConfigured: Boolean(env.AI),
         conditionPrimaryModel: CONDITION_PRIMARY_MODEL,
         conditionFallbackModel: CONDITION_FALLBACK_MODEL,
-        architecture: 'evidence-gated identity + targeted multimodal condition consensus + live market',
+        architecture: 'stage-isolated evidence graph + reference-assisted condition/centering + adaptive live market',
+        featureFlags: FEATURE_FLAGS,
+        performanceBudgetMs: PERFORMANCE_BUDGET_MS,
       }, 200, cors);
     }
 
@@ -72,6 +115,31 @@ export default {
         return json({ok:result.ok,version:VERSION,selftest:result},result.ok?200:500,cors);
       }
 
+      if (url.pathname === '/condition' && request.method === 'POST') {
+        const body=await request.json();
+        const front=validateImage(body.front,'front');
+        const back=validateImage(body.back,'back');
+        const started=nowMs();
+        const photoQuality={front:qualityScore(body?.photoQuality?.front),back:qualityScore(body?.photoQuality?.back)};
+        let [frontCondition,backCondition]=await Promise.all([
+          inspectConditionSide(env,'front',front,photoQuality.front),
+          inspectConditionSide(env,'back',back,photoQuality.back),
+        ]);
+        let condition=combineCondition(frontCondition,backCondition,photoQuality);
+        let referenceTemplate=null;
+        if (Array.isArray(body.referenceImages) && body.referenceImages.length && (condition.confidence<62 || conditionCompleteness(condition)<4)) {
+          referenceTemplate=await buildReferenceTemplate(env,body.referenceImages.slice(0,3),body.identity||null).catch(()=>null);
+          if(referenceTemplate){
+            condition=await refineConditionWithReference(env,front,back,condition,referenceTemplate,photoQuality);
+          }
+        }
+        return json({
+          ok:true,version:VERSION,
+          analysis:{condition,condition_confidence:condition.confidence,reference_template:referenceTemplate},
+          diagnostics:{timingsMs:{condition:cleanMs(nowMs()-started)},conditionModels:{front:condition?.sides?.front?.modelPath||null,back:condition?.sides?.back?.modelPath||null},photoQuality,referenceTemplateUsed:Boolean(referenceTemplate),featureFlags:FEATURE_FLAGS,performanceBudgetMs:PERFORMANCE_BUDGET_MS}
+        },200,cors);
+      }
+
       if (url.pathname === '/market' && request.method === 'POST') {
         const body = await request.json();
         const identity = sanitizeLockedIdentity(body.identity);
@@ -79,7 +147,7 @@ export default {
         const front = typeof body.front === 'string' && /^data:image\/(jpeg|jpg|png|webp);base64,/i.test(body.front) ? body.front : null;
         const started=nowMs();
         const market = await getMarket(env, identity, front);
-        return json({ ok:true, version:VERSION, market, ebay:market.ebay || null, diagnostics:{timingsMs:{market:cleanMs(nowMs()-started)}} }, 200, cors);
+        return json({ ok:true, version:VERSION, market, ebay:market.ebay || null, diagnostics:{timingsMs:{market:cleanMs(nowMs()-started)},featureFlags:FEATURE_FLAGS,performanceBudgetMs:PERFORMANCE_BUDGET_MS} }, 200, cors);
       }
 
       if (url.pathname !== '/analyze' || request.method !== 'POST') return json({ ok: false, error: 'Not found' }, 404, cors);
@@ -88,7 +156,11 @@ export default {
       const body = await request.json();
       const front = validateImage(body.front, 'front');
       const back = validateImage(body.back, 'back');
+      const frontIdentity = body.frontIdentity ? validateImage(body.frontIdentity,'front identity') : front;
+      const backIdentity = body.backIdentity ? validateImage(body.backIdentity,'back identity') : back;
       const lockedIdentity = sanitizeLockedIdentity(body.identityLock);
+      const lockedCondition = sanitizeConditionLock(body.conditionLock);
+      const trustedHint = sanitizeTrustedHint(body.trustedHint);
       const requestStarted = nowMs();
       const conditionStarted = nowMs();
       let conditionDurationMs = 0;
@@ -99,13 +171,15 @@ export default {
         back: qualityScore(body?.photoQuality?.back),
       };
 
-      const conditionPromise = Promise.all([
-        inspectConditionSide(env, 'front', front, photoQuality.front),
-        inspectConditionSide(env, 'back', back, photoQuality.back),
-      ]).then(([frontCondition, backCondition]) => {
-        conditionDurationMs = nowMs() - conditionStarted;
-        return combineCondition(frontCondition, backCondition, photoQuality);
-      });
+      const conditionPromise = lockedCondition
+        ? Promise.resolve({...lockedCondition,reused:true}).then(x=>{conditionDurationMs=0;return x;})
+        : Promise.all([
+            inspectConditionSide(env, 'front', front, photoQuality.front),
+            inspectConditionSide(env, 'back', back, photoQuality.back),
+          ]).then(([frontCondition, backCondition]) => {
+            conditionDurationMs = nowMs() - conditionStarted;
+            return combineCondition(frontCondition, backCondition, photoQuality);
+          });
 
       let google = null;
       let webLookup = { configured:Boolean(env.TAVILY_API_KEY), used:false, query:'', queries:[], results:[], answer:null };
@@ -129,14 +203,14 @@ export default {
           reference_images:Array.isArray(body.referenceImages)?body.referenceImages.slice(0,8):[],
         };
       } else {
-        const googleInitial = await googleVisionInitial(env, front, back);
+        const googleInitial = await googleVisionInitial(env, frontIdentity, backIdentity);
         let backWebFallback = null;
         if (googleWebStrength(googleInitial.front) < 2) {
-          try { backWebFallback = await googleVisionWebOnly(env, back); }
+          try { backWebFallback = await googleVisionWebOnly(env, backIdentity); }
           catch (e) { console.warn('Google back Web Detection fallback:', e); }
         }
         google = combineGoogleEvidence(googleInitial, backWebFallback);
-        const provisional = provisionalFromGoogle(google);
+        const provisional = applyTrustedHint(provisionalFromGoogle(google),trustedHint);
 
         if (env.TAVILY_API_KEY) {
           try { webLookup = await trustedCardLookup(env, provisional, google); }
@@ -149,7 +223,29 @@ export default {
       }
       identityDurationMs = nowMs() - identityStarted;
 
-      const condition = await conditionPromise;
+      let condition = await conditionPromise;
+      let referenceTemplate=null;
+      let referenceDurationMs=0;
+      const referenceStarted=nowMs();
+      const referenceImages=identityResult.reference_images||[];
+      const localCentering=body.localCentering||null;
+      const needsReference=referenceImages.length && (
+        Number(condition?.confidence||0)<62 ||
+        conditionCompleteness(condition)<4 ||
+        centeringNeedsReference(localCentering?.front) ||
+        centeringNeedsReference(localCentering?.back)
+      );
+      if(needsReference){
+        referenceTemplate=await buildReferenceTemplate(env,referenceImages.slice(0,3),identityResult.identity).catch(e=>{console.warn('Reference template:',e);return null});
+        if(referenceTemplate){
+          if(Number(condition?.confidence||0)<70 || conditionCompleteness(condition)<4){
+            condition=await refineConditionWithReference(env,front,back,condition,referenceTemplate,photoQuality);
+          }
+          condition=await refineCenteringWithReference(env,front,back,condition,referenceTemplate,localCentering);
+        }
+      }
+      referenceDurationMs=nowMs()-referenceStarted;
+
       const analysis = {
         identity: identityResult.identity,
         condition,
@@ -166,6 +262,7 @@ export default {
         field_confidence: identityResult.field_confidence || {},
         evidence_graph: identityResult.evidence_graph || {},
         reference_images: identityResult.reference_images || [],
+        reference_template: referenceTemplate,
       };
 
       let market = emptyMarket(analysis.identity);
@@ -191,25 +288,32 @@ export default {
           results: (webLookup.results || []).slice(0, 10).map(x => ({ title:x.title, url:x.url, score:x.score, trustTier:x.trustTier, exactCode:x.exactCode })),
         },
         pipeline: {
-          identity: lockedIdentity ? 'Verified identity lock reused' : 'Google OCR/Web Detection → trusted-source exact-card verification → variant/serial evidence gate',
-          condition: 'Gemma 4 vision primary → targeted Moondream consensus/fallback only when needed',
-          centering: 'Measured locally; independent vision cross-check is used as a disagreement guard',
+          identity: lockedIdentity ? 'Verified identity cache reused' : 'Normalized Google OCR/Web Detection → source hierarchy → serial/parallel arbitration → reference-image evidence graph',
+          condition: lockedCondition ? 'Validated condition stage cache reused' : 'Gemma 4 primary → Moondream dispute check → targeted arbitration → reference-template refinement only when needed',
+          centering: 'Local geometry first; extreme/uncertain measurements require independent vision/reference-template corroboration',
           grading: 'Calculated locally from published grading standards/guidelines',
-          market: market.live ? 'Official eBay Browse API keyword/image matching' : 'Web-indexed fallback until eBay API credentials are connected',
+          market: market.live ? 'Official eBay Browse API adaptive exact→broader search + image matching + strict post-filtering' : 'Web-indexed fallback with strict identity filtering',
         },
         diagnostics: {
           timingsMs: {
             identity: cleanMs(identityDurationMs),
             condition: cleanMs(conditionDurationMs),
             market: cleanMs(marketDurationMs),
+            reference: cleanMs(referenceDurationMs),
             total: cleanMs(nowMs()-requestStarted),
           },
+          stagesReused:{identity:Boolean(lockedIdentity),condition:Boolean(lockedCondition),market:false},
+          localTrustedHintUsed:Boolean(trustedHint),
+          referenceTemplateUsed:Boolean(referenceTemplate),
           conditionModels: {
             front: condition?.sides?.front?.modelPath || null,
             back: condition?.sides?.back?.modelPath || null,
           },
           photoQuality,
           variantStatus: analysis.variant_status,
+          featureFlags: FEATURE_FLAGS,
+          performanceBudgetMs: PERFORMANCE_BUDGET_MS,
+          overBudget: budgetStatus({identity:identityDurationMs,condition:conditionDurationMs,market:marketDurationMs,reference:referenceDurationMs,total:nowMs()-requestStarted}),
         },
         privacy: 'Front/back images are sent transiently to Google Cloud Vision and Cloudflare Workers AI. If eBay API image search is configured, the front analysis image is also sent to eBay Browse API. Tavily receives text/search clues, not card images. This Worker does not persist images or collection data.',
       }, 200, cors);
@@ -716,6 +820,42 @@ function serialDenominator(serial){
   const m=String(serial||'').match(/\/\s*(\d{1,5})\b/);
   return m?Number(m[1]):null;
 }
+
+async function readSerialNumberVision(env,backImage,catalog){
+  if(!backImage)return null;
+  const denoms=[...new Set((catalog||[]).flatMap(x=>x.denominators||[]).filter(Number.isFinite))].sort((a,b)=>a-b);
+  if(!denoms.length)return null;
+  const prompt=`Read ONLY a collector serial number printed/stamped on the back of this trading card. Expected documented denominators for this exact card include: ${denoms.map(x=>'/'+x).join(', ')}.
+Return ONLY JSON {"serial":string|null,"confidence":number,"evidence":string|null}.
+A valid serial must be in numerator/denominator form such as 23/99. Do not use statistics, dates, jersey numbers, copyright years, or card number as serial numbering. If not clearly visible, return null.`;
+  try{
+    const raw=await env.AI.run(CONDITION_PRIMARY_MODEL,{messages:[{role:'system',content:'You are a precise OCR verifier for stamped trading-card serial numbering.'},{role:'user',content:prompt}],image:backImage,temperature:0,max_tokens:350,stream:false});
+    const obj=structuredModelResult(raw,'serial verifier');
+    const serial=extractSerialNumber(String(obj?.serial||''));
+    const confidence=clamp(Math.round(Number(obj?.confidence)||0),0,100);
+    if(!serial||confidence<80)return null;
+    const denom=serialDenominator(serial);
+    if(!denoms.includes(denom))return null;
+    return {serial,confidence,evidence:clean(obj?.evidence)};
+  }catch(e){console.warn('Serial vision verifier:',e);return null}
+}
+async function inspectVariantVisual(env,frontImage,catalog){
+  if(!frontImage)return null;
+  const candidates=(catalog||[]).filter(x=>x.weight>=4).slice(0,10);
+  if(candidates.length<1)return null;
+  const prompt=`The exact trading card is already established. Determine whether the photographed FRONT visibly matches one documented parallel candidate below.
+CANDIDATES: ${JSON.stringify(candidates.map(x=>({name:x.name,numbered:x.denominators})))}
+Return ONLY JSON {"candidate":string|null,"confidence":number,"visible_cues":[string]}.
+Do not invent a parallel. A numbered candidate cannot be confirmed from front color alone; it may only be returned as a visual candidate, never as serial verification. If more than one candidate is plausible or cues are weak, return null.`;
+  try{
+    const raw=await env.AI.run(CONDITION_PRIMARY_MODEL,{messages:[{role:'system',content:'You are a conservative visual parallel classifier. Ambiguity must return null.'},{role:'user',content:prompt}],image:frontImage,temperature:0,max_tokens:500,stream:false});
+    const obj=structuredModelResult(raw,'variant visual classifier');
+    const name=clean(obj?.candidate),confidence=clamp(Math.round(Number(obj?.confidence)||0),0,100);
+    const hit=candidates.find(x=>normalizeTitle(x.name)===normalizeTitle(name));
+    if(!hit||confidence<90)return null;
+    return {candidate:hit,confidence,visible_cues:Array.isArray(obj?.visible_cues)?obj.visible_cues.map(clean).filter(Boolean).slice(0,6):[]};
+  }catch(e){console.warn('Variant visual classifier:',e);return null}
+}
 function resolveVariantEvidence(parsedVariation, serialNumber, sources, pages){
   const catalog=buildVariantCatalog(sources,pages);
   const denom=serialDenominator(serialNumber);
@@ -847,10 +987,24 @@ RETURN:
   const used=sourceIdx.map(i=>exactSources[i]).filter(Boolean);
   const supporting=used.length?used:exactSources;
   const sourceTexts=supporting.map(x=>`${x.title||''} ${x.content||''}`);
-  const split=separateSetAndVariation(identity.set,identity.variation,[...sourceTexts,...exactGooglePages.map(p=>p.title||'')],provisional.serialNumber);
+  let serialNumber=provisional.serialNumber;
+  const initialCatalog=buildVariantCatalog(exactSources,exactGooglePages);
+  let serialVision=null;
+  if(!serialNumber && initialCatalog.some(x=>(x.denominators||[]).length) && backImage){
+    serialVision=await readSerialNumberVision(env,backImage,initialCatalog);
+    if(serialVision)serialNumber=serialVision.serial;
+  }
+  const split=separateSetAndVariation(identity.set,identity.variation,[...sourceTexts,...exactGooglePages.map(p=>p.title||'')],serialNumber);
   identity.set=split.set;
   identity.variation=split.variation;
-  const variantResolution=resolveVariantEvidence(identity.variation,provisional.serialNumber,exactSources,exactGooglePages);
+  let variantResolution=resolveVariantEvidence(identity.variation,serialNumber,exactSources,exactGooglePages);
+  let variantVisual=null;
+  if(variantResolution.status==='unresolved' && !serialNumber && frontImage){
+    variantVisual=await inspectVariantVisual(env,frontImage,variantResolution.catalog);
+    if(variantVisual && !(variantVisual.candidate.denominators||[]).length && variantVisual.candidate.weight>=6){
+      variantResolution={...variantResolution,variation:variantVisual.candidate.name,status:'probable',matched:variantVisual.candidate,reason:'High-confidence visual cue matched a documented unnumbered parallel.'};
+    }
+  }
   identity.variation=variantResolution.variation;
   if (identity.subject && !sourceTexts.some(t=>containsSubject(t,identity.subject))) identity.subject=null;
   if (identity.year && !sourceTexts.some(t=>new RegExp(`\\b${identity.year}\\b`).test(t))) identity.year=null;
@@ -894,7 +1048,7 @@ RETURN:
   if (yearSupported) evidence.push(`Product year ${identity.year} is sourced online rather than inferred from card statistics.`);
   if (setSupported) evidence.push(`Set/insert identity is supported by the trusted exact-card sources.`);
   if (uniqueStrongDomains.size>=2) evidence.push(`${uniqueStrongDomains.size} independent established source domains agree on the exact card.`);
-  if (provisional.serialNumber) evidence.push(`Serial-number text detected on the card: ${provisional.serialNumber}.`);
+  if (serialNumber) evidence.push(`Serial-number evidence detected on the card: ${serialNumber}${serialVision?' (targeted visual/OCR verification)':''}.`);
   if (variantResolution.status==='verified') evidence.push(`Parallel ${identity.variation} was tied to the detected serial denominator by trusted-source evidence.`);
   if (variantResolution.status==='unresolved') evidence.push('Parallel/variation was intentionally withheld because the evidence conflicts or is incomplete.');
 
@@ -909,15 +1063,15 @@ RETURN:
     year:yearSupported?clamp(82+uniqueStrongDomains.size*4,0,99):35,
     set:setSupported?clamp(80+uniqueStrongDomains.size*4,0,99):35,
     variation:variantResolution.status==='verified'?96:variantResolution.status==='probable'?78:variantResolution.status==='unresolved'?20:(identity.variation?55:40),
-    serialNumber:provisional.serialNumber?92:0,
+    serialNumber:serialNumber?(serialVision?Math.max(90,serialVision.confidence):92):0,
   };
   const evidence_graph={
     cardNo:{value:identity.cardNo,supportingDomains:[...new Set(exactSources.filter(x=>exactTokenPresent(`${x.title||''} ${x.content||''}`,identity.cardNo)).map(x=>x.domain))]},
     subject:{value:identity.subject,supportingDomains:[...new Set(exactSources.filter(x=>containsSubject(`${x.title||''} ${x.content||''}`,identity.subject)).map(x=>x.domain))]},
     year:{value:identity.year,supportingDomains:[...new Set(exactSources.filter(x=>identity.year&&new RegExp(`\\b${identity.year}\\b`).test(`${x.title||''} ${x.content||''}`)).map(x=>x.domain))]},
     set:{value:identity.set,supportingDomains:[...new Set(exactSources.filter(x=>containsSet(`${x.title||''} ${x.content||''}`,identity.set)).map(x=>x.domain))]},
-    variation:{value:identity.variation,status:variantResolution.status,reason:variantResolution.reason,candidates:variantResolution.catalog.map(x=>({name:x.name,denominators:x.denominators,weight:x.weight}))},
-    serialNumber:{value:provisional.serialNumber,source:provisional.serialNumber?'physical-card OCR':null},
+    variation:{value:identity.variation,status:variantResolution.status,reason:variantResolution.reason,candidates:variantResolution.catalog.map(x=>({name:x.name,denominators:x.denominators,weight:x.weight})),visualArbitration:variantVisual?{candidate:variantVisual.candidate.name,confidence:variantVisual.confidence,cues:variantVisual.visible_cues}:null},
+    serialNumber:{value:serialNumber,source:serialNumber?(serialVision?'targeted back-photo serial verifier':'physical-card OCR'):null,evidence:serialVision?.evidence||null},
   };
   const reference_images=[...new Set(exactGooglePages.flatMap(p=>p.referenceImages||[]).filter(Boolean))].slice(0,8);
 
@@ -930,7 +1084,7 @@ RETURN:
     needs_review:verification_status!=='verified',
     review_reason:reviewReason,
     selected_card_code:selectedCode,
-    serial_number:provisional.serialNumber,
+    serial_number:serialNumber,
     variant_status:variantResolution.status,
     field_confidence,
     evidence_graph,
@@ -1012,10 +1166,65 @@ async function runConditionFallback(env, side, image, question) {
   return {text:modelText(raw),model:CONDITION_FALLBACK_MODEL};
 }
 
+
+function conditionNumber(v){
+  if(v===null||v===undefined||v==='')return null;
+  const n=Number(v);
+  return Number.isFinite(n)&&n>=1&&n<=10?n:null;
+}
+function conditionSupportText(x){
+  return String([...(x?.notes||[]),...Object.entries(x?.defects||{}).filter(([,v])=>v).map(([k])=>k)].join(' ')).toLowerCase();
+}
+function conditionIntegrityIssues(x){
+  if(!x||typeof x!=='object')return ['missing condition result'];
+  const issues=[];
+  const fields=['corners','edges','surface','focus'];
+  const vals=fields.map(k=>conditionNumber(x[k])).filter(v=>v!==null);
+  const support=conditionSupportText(x);
+  const defectCount=Object.values(x?.defects||{}).filter(Boolean).length;
+  if(vals.length===4 && vals.every(v=>v<=2) && defectCount===0) issues.push('catastrophic scores without visible defect evidence');
+  const evidenceWords=/wear|damage|chip|whiten|round|soft|fuzz|scratch|scuff|crease|dent|stain|mark|print|line|registration|focus|surface loss|corner/i;
+  for(const k of fields){
+    const v=conditionNumber(x[k]);
+    if(v!==null&&v<7&&defectCount===0&&!evidenceWords.test(support))issues.push(`${k} below 7 without supporting evidence`);
+  }
+  return [...new Set(issues)];
+}
+function sanitizeConditionAssessment(x){
+  if(!x||typeof x!=='object')return null;
+  const out={...x,defects:{...(x.defects||{})},notes:Array.isArray(x.notes)?[...x.notes]:[]};
+  const issues=conditionIntegrityIssues(out);
+  if(issues.some(z=>z.includes('catastrophic'))){
+    for(const k of ['corners','edges','surface','focus'])out[k]=null;
+    out.confidence=0;
+    out.notes.push('Condition scores rejected because the model reported catastrophic values without corresponding visible defects.');
+  }else{
+    const support=conditionSupportText(out);
+    const evidenceWords=/wear|damage|chip|whiten|round|soft|fuzz|scratch|scuff|crease|dent|stain|mark|print|line|registration|focus|surface loss|corner/i;
+    const defectCount=Object.values(out.defects||{}).filter(Boolean).length;
+    for(const k of ['corners','edges','surface','focus']){
+      const v=conditionNumber(out[k]);
+      if(v!==null&&v<7&&defectCount===0&&!evidenceWords.test(support)){
+        out[k]=null;
+        out.notes.push(`${k} score withheld because a sub-7 score lacked visible supporting evidence.`);
+      }
+    }
+  }
+  out.integrityIssues=conditionIntegrityIssues(out);
+  return out;
+}
+function conditionNeedsArbitration(x){
+  if(!x)return true;
+  if(conditionCompleteness(x)<4)return true;
+  if((x.integrityIssues||conditionIntegrityIssues(x)).length)return true;
+  if(Number(x.agreement)>2)return true;
+  return false;
+}
 function conditionNeedsConsensus(x) {
+  if(!x || conditionIntegrityIssues(x).length)return true;
   if(conditionCompleteness(x)<4)return true;
   if(Number(x?.confidence||0)<35)return true;
-  if(['corners','edges','surface','focus'].some(k=>Number.isFinite(Number(x?.[k]))&&Number(x[k])<8.5))return true;
+  if(['corners','edges','surface','focus'].some(k=>{const v=conditionNumber(x?.[k]);return v!==null&&v<8.5}))return true;
   if(Object.values(x?.defects||{}).some(Boolean))return true;
   return false;
 }
@@ -1035,12 +1244,12 @@ function mergeConditionConsensus(a,b,side,photoQuality) {
   const out={side,defects:{},notes:[]};
   let diffSum=0,diffN=0,conflicts=0;
   for(const k of ['corners','edges','surface','focus']){
-    const av=Number(a?.[k]),bv=Number(b?.[k]);
-    if(Number.isFinite(av)&&Number.isFinite(bv)){
+    const av=conditionNumber(a?.[k]),bv=conditionNumber(b?.[k]);
+    if(av!==null&&bv!==null){
       const d=Math.abs(av-bv);diffSum+=d;diffN++;
       if(d>2){out[k]=null;conflicts++}
       else out[k]=clampHalf(Math.min(av,bv),1,10);
-    }else out[k]=Number.isFinite(av)?av:Number.isFinite(bv)?bv:null;
+    }else out[k]=av!==null?av:bv!==null?bv:null;
   }
   for(const k of ['crease','dent','stain','scratch','printline','mark','possible_alteration'])out.defects[k]=Boolean(a?.defects?.[k]||b?.defects?.[k]);
   const agreement=diffN?diffSum/diffN:null;
@@ -1074,7 +1283,7 @@ Centering is printed-design centering only and must be null unless a real printe
   let primary=null;
   try{
     const r=await runConditionPrimary(env,side,image,question);
-    primary=parseConditionFlexible(r.text,side);
+    primary=sanitizeConditionAssessment(parseConditionFlexible(r.text,side));
     primary.modelPath='Gemma 4';
   }catch(e){
     console.warn('Primary condition model:',e);
@@ -1089,14 +1298,20 @@ Centering is printed-design centering only and must be null unless a real printe
   let fallback=null;
   try{
     const r=await runConditionFallback(env,side,image,question);
-    fallback=parseConditionFlexible(r.text,side);
+    fallback=sanitizeConditionAssessment(parseConditionFlexible(r.text,side));
     fallback.modelPath='Moondream 3.1';
   }catch(e){
     console.warn('Fallback condition model:',e);
   }
 
-  if(primary && fallback && conditionCompleteness(primary)>=3 && conditionCompleteness(fallback)>=3){
-    return mergeConditionConsensus(primary,fallback,side,photoQuality);
+  if(primary && fallback && conditionCompleteness(primary)>=2 && conditionCompleteness(fallback)>=2){
+    let merged=sanitizeConditionAssessment(mergeConditionConsensus(primary,fallback,side,photoQuality));
+    if(conditionNeedsArbitration(merged)){
+      const disputed=['corners','edges','surface','focus'].filter(k=>{const m=conditionNumber(merged?.[k]),a=conditionNumber(primary?.[k]),b=conditionNumber(fallback?.[k]);return m===null||(a!==null&&b!==null&&Math.abs(a-b)>2)});
+      const arb=await runConditionArbitrator(env,side,image,disputed);
+      if(arb)merged=mergeConditionArbitration(merged,arb,side,photoQuality);
+    }
+    return sanitizeConditionAssessment(merged);
   }
 
   const best=[primary,fallback].filter(Boolean).sort((a,b)=>conditionCompleteness(b)-conditionCompleteness(a)||Number(b.confidence||0)-Number(a.confidence||0))[0];
@@ -1107,12 +1322,173 @@ Centering is printed-design centering only and must be null unless a real printe
       best.confidence=Math.min(best.confidence,30);
       best.notes.push('Automatic condition score withheld where the available vision output was incomplete.');
     }
-    return best;
+    return sanitizeConditionAssessment(best);
   }
 
   return unknownConditionSide(side,'Both condition-vision paths were unavailable.');
 }
 
+
+async function runConditionArbitrator(env,side,image,fields){
+  if(!fields?.length)return null;
+  const prompt=`Re-check ONLY these condition fields on the ${side} of this raw trading card: ${fields.join(', ')}.
+Return one JSON object with corners,edges,surface,focus,defects,confidence,notes. Fields not requested must be null.
+Do not identify the card. Do not use 1 as a placeholder. A score below 7 requires a clearly visible named defect in notes or defects. If uncertain, return null.`;
+  try{
+    const raw=await env.AI.run(CONDITION_PRIMARY_MODEL,{
+      messages:[
+        {role:'system',content:'You are an independent dispute-resolution pass for visible trading-card condition. Fail closed on uncertainty.'},
+        {role:'user',content:prompt}
+      ],image,temperature:0,max_tokens:700,stream:false
+    });
+    const out=sanitizeConditionAssessment(parseConditionFlexible(modelText(raw),side));
+    if(out)out.modelPath='Gemma 4 targeted arbitration';
+    return out;
+  }catch(e){console.warn('Condition arbitration:',e);return null}
+}
+function mergeConditionArbitration(base,arb,side,photoQuality){
+  const out={...base,side,defects:{...(base?.defects||{})},notes:[...(base?.notes||[])]};
+  for(const k of ['corners','edges','surface','focus']){
+    const a=conditionNumber(out[k]),b=conditionNumber(arb?.[k]);
+    if(a===null&&b!==null)out[k]=b;
+    else if(a!==null&&b!==null&&Math.abs(a-b)<=1.5)out[k]=clampHalf(Math.min(a,b),1,10);
+    else if(a!==null&&b!==null&&Math.abs(a-b)>2)out[k]=null;
+  }
+  for(const k of ['crease','dent','stain','scratch','printline','mark','possible_alteration'])out.defects[k]=Boolean(out.defects[k]||arb?.defects?.[k]);
+  out.notes=Array.from(new Set([...out.notes,...(arb?.notes||[]),'A targeted third pass was used only for disputed condition fields.'])).slice(0,10);
+  out.confidence=calibrateConditionConfidence(out,photoQuality,null);
+  out.modelPath=`${base?.modelPath||'consensus'} + targeted arbitration`;
+  return sanitizeConditionAssessment(out);
+}
+
+function safeRemoteImageUrl(value){
+  try{
+    const u=new URL(String(value||''));
+    if(u.protocol!=='https:')return null;
+    const h=u.hostname.toLowerCase();
+    if(h==='localhost'||h.endsWith('.local')||/^127\./.test(h)||/^10\./.test(h)||/^192\.168\./.test(h)||/^169\.254\./.test(h)||/^172\.(1[6-9]|2\d|3[01])\./.test(h)||h==='::1')return null;
+    return u.href;
+  }catch{return null}
+}
+function arrayBufferToDataUrl(buf,type='image/jpeg'){
+  const bytes=new Uint8Array(buf);let binary='';const chunk=0x8000;
+  for(let i=0;i<bytes.length;i+=chunk)binary+=String.fromCharCode(...bytes.subarray(i,i+chunk));
+  return `data:${type};base64,${btoa(binary)}`;
+}
+async function fetchReferenceImageData(url){
+  const safe=safeRemoteImageUrl(url);if(!safe)return null;
+  const r=await fetch(safe,{headers:{'Accept':'image/*'}});
+  if(!r.ok)return null;
+  const type=String(r.headers.get('content-type')||'');
+  if(!type.startsWith('image/'))return null;
+  const len=Number(r.headers.get('content-length')||0);
+  if(len>4_000_000)return null;
+  const buf=await r.arrayBuffer();
+  if(buf.byteLength>4_000_000)return null;
+  return arrayBufferToDataUrl(buf,type.split(';')[0]||'image/jpeg');
+}
+async function buildReferenceTemplate(env,urls,identity){
+  for(const u of urls||[]){
+    try{
+      const image=await fetchReferenceImageData(u);if(!image)continue;
+      const prompt=`This is an online reference image for the exact trading-card identity ${JSON.stringify(identity||{})}.
+Describe only stable printed/design features that can help distinguish intentional artwork from damage and help locate a true printed border/frame.
+Return ONLY JSON:
+{"border_style":"framed|borderless|mixed|unknown","measurable_frame":boolean,"intentional_design_marks":[string],"dominant_design_colors":[string],"foil_or_parallel_cues":[string],"notes":[string]}
+Do not grade the reference card and do not infer the photographed user's card condition.`;
+      const raw=await env.AI.run(CONDITION_PRIMARY_MODEL,{
+        messages:[{role:'system',content:'Extract stable design-template facts from a trading-card reference image.'},{role:'user',content:prompt}],
+        image,temperature:0,max_tokens:650,stream:false
+      });
+      const obj=structuredModelResult(raw,'reference template');
+      return {
+        sourceUrl:safeRemoteImageUrl(u),
+        border_style:['framed','borderless','mixed','unknown'].includes(obj?.border_style)?obj.border_style:'unknown',
+        measurable_frame:Boolean(obj?.measurable_frame),
+        intentional_design_marks:Array.isArray(obj?.intentional_design_marks)?obj.intentional_design_marks.map(clean).filter(Boolean).slice(0,8):[],
+        dominant_design_colors:Array.isArray(obj?.dominant_design_colors)?obj.dominant_design_colors.map(clean).filter(Boolean).slice(0,8):[],
+        foil_or_parallel_cues:Array.isArray(obj?.foil_or_parallel_cues)?obj.foil_or_parallel_cues.map(clean).filter(Boolean).slice(0,8):[],
+        notes:Array.isArray(obj?.notes)?obj.notes.map(clean).filter(Boolean).slice(0,6):[],
+      };
+    }catch(e){console.warn('Reference image template attempt:',e)}
+  }
+  return null;
+}
+async function inspectConditionWithTemplate(env,side,image,template,photoQuality){
+  const prompt=`Inspect ONLY visible physical condition on the ${side} of this raw trading card.
+A verified reference image established these stable printed-design facts:
+${JSON.stringify(template)}
+Do not count those intentional design features as defects. Do not copy condition from the reference.
+Return ONLY JSON {"corners":number|null,"edges":number|null,"surface":number|null,"focus":number|null,"defects":[],"confidence":number,"center_lr":string|null,"center_tb":string|null,"center_confidence":number,"notes":[]}.
+Never use 1 as a placeholder; scores below 7 require clearly visible named damage. If the design is borderless or no true frame is measurable, centering must be null.`;
+  try{
+    const raw=await env.AI.run(CONDITION_PRIMARY_MODEL,{
+      messages:[{role:'system',content:'Use the reference template only to distinguish intentional card design from physical defects.'},{role:'user',content:prompt}],
+      image,temperature:0,max_tokens:850,stream:false
+    });
+    const out=sanitizeConditionAssessment(parseConditionFlexible(modelText(raw),side));
+    if(out){
+      out.confidence=calibrateConditionConfidence(out,photoQuality,null);
+      out.modelPath='Gemma 4 + verified reference template';
+      out.notes=Array.from(new Set([...(out.notes||[]),'Verified reference-template design masking was applied.'])).slice(0,9);
+    }
+    return out;
+  }catch(e){console.warn('Reference condition pass:',e);return null}
+}
+function betterConditionSide(a,b){
+  if(!a)return b;if(!b)return a;
+  const ac=conditionCompleteness(a),bc=conditionCompleteness(b);
+  if(bc>ac)return b;if(ac>bc)return a;
+  const ai=conditionIntegrityIssues(a).length,bi=conditionIntegrityIssues(b).length;
+  if(bi<ai)return b;if(ai<bi)return a;
+  return Number(b.confidence||0)>Number(a.confidence||0)+8?b:a;
+}
+async function refineConditionWithReference(env,front,back,condition,template,photoQuality){
+  const oldFront=condition?.sides?.front,oldBack=condition?.sides?.back;
+  const tasks=[];
+  const frontNeed=!oldFront||conditionCompleteness(oldFront)<4||Number(oldFront.confidence||0)<58||conditionIntegrityIssues(oldFront).length;
+  const backNeed=!oldBack||conditionCompleteness(oldBack)<4||Number(oldBack.confidence||0)<58||conditionIntegrityIssues(oldBack).length;
+  tasks.push(frontNeed?inspectConditionWithTemplate(env,'front',front,template,photoQuality.front):Promise.resolve(null));
+  tasks.push(backNeed?runConditionArbitrator(env,'back',back,['corners','edges','surface','focus']):Promise.resolve(null));
+  const [frontRef,backRef]=await Promise.all(tasks);
+  const f=betterConditionSide(oldFront,frontRef);
+  const b=betterConditionSide(oldBack,backRef);
+  return combineCondition(f||unknownConditionSide('front','No reliable front condition result.'),b||unknownConditionSide('back','No reliable back condition result.'),photoQuality);
+}
+function centeringNeedsReference(meta){
+  if(!meta)return false;
+  if(meta.reliable===false)return true;
+  const c=meta.values||meta;
+  const pairs=[c.lr,c.tb].filter(Array.isArray);
+  return pairs.some(p=>Math.max(...p.map(Number))>70);
+}
+async function inspectCenteringWithTemplate(env,side,image,template){
+  if(!template?.measurable_frame || template?.border_style==='borderless')return null;
+  const prompt=`Measure printed-design centering only on the ${side} of this trading card. The verified reference template says:
+${JSON.stringify({border_style:template.border_style,measurable_frame:template.measurable_frame,notes:template.notes})}
+Ignore the physical photo background and internal artwork lines. Return ONLY JSON {"lr":"55/45"|null,"tb":"52/48"|null,"confidence":number,"reason":string}. If the true design frame cannot be located, return null pairs.`;
+  try{
+    const raw=await env.AI.run(CONDITION_PRIMARY_MODEL,{messages:[{role:'system',content:'Measure only true printed-frame centering; fail closed when no measurable frame exists.'},{role:'user',content:prompt}],image,temperature:0,max_tokens:400,stream:false});
+    const obj=structuredModelResult(raw,'reference centering');
+    const lr=parsePair(obj?.lr),tb=parsePair(obj?.tb),confidence=clamp(Math.round(Number(obj?.confidence)||0),0,100);
+    if(!lr||!tb||confidence<65)return null;
+    return {lr,tb,confidence,reason:clean(obj?.reason)||'reference-template visual centering'};
+  }catch(e){console.warn('Reference centering:',e);return null}
+}
+async function refineCenteringWithReference(env,front,back,condition,template,localCentering){
+  if(!condition?.sides)return condition;
+  const jobs=[];
+  for(const [side,img] of [['front',front],['back',back]]){
+    jobs.push(centeringNeedsReference(localCentering?.[side])?inspectCenteringWithTemplate(env,side,img,template):Promise.resolve(null));
+  }
+  const [fc,bc]=await Promise.all(jobs);
+  if(fc)condition.sides.front.centering=fc;
+  if(bc)condition.sides.back.centering=bc;
+  if(fc||bc){
+    condition.notes=Array.from(new Set([...(condition.notes||[]),'Reference-template centering was used only where local geometry was unreliable/extreme.'])).slice(0,10);
+  }
+  return condition;
+}
 function parseConditionFlexible(text, side) {
   const raw=String(text||'').trim();
   if (raw) {
@@ -1141,7 +1517,7 @@ function conditionFromObject(obj, side) {
   const conf=clamp(Math.round(Number(obj?.confidence ?? obj?.CONFIDENCE) || 0),0,100);
   const centerConf=clamp(Math.round(Number(obj?.center_confidence ?? obj?.CENTER_CONFIDENCE) || 0),0,100);
   const notes=Array.isArray(obj?.notes)?obj.notes:[obj?.notes ?? obj?.NOTES];
-  return {
+  return sanitizeConditionAssessment({
     side,
     corners:score(obj?.corners ?? obj?.CORNERS),
     edges:score(obj?.edges ?? obj?.EDGES),
@@ -1151,7 +1527,7 @@ function conditionFromObject(obj, side) {
     confidence:conf,
     centering:{lr,tb,confidence:lr&&tb?centerConf:0},
     notes:notes.map(clean).filter(Boolean).slice(0,6),
-  };
+  });
 }
 
 async function normalizeConditionOutput(env, side, text) {
@@ -1238,7 +1614,7 @@ function parseConditionKV(text, side) {
 }
 
 function conditionCompleteness(x) {
-  return ['corners','edges','surface','focus'].filter(k=>Number.isFinite(Number(x?.[k]))).length;
+  return ['corners','edges','surface','focus'].filter(k=>conditionNumber(x?.[k])!==null).length;
 }
 
 function unknownConditionSide(side, note) {
@@ -1250,8 +1626,10 @@ function unknownConditionSide(side, note) {
 }
 
 function combineCondition(front, back, photoQuality={}) {
+  front=sanitizeConditionAssessment(front)||unknownConditionSide('front','Invalid front condition response.');
+  back=sanitizeConditionAssessment(back)||unknownConditionSide('back','Invalid back condition response.');
   const worse = k => {
-    const vals=[front?.[k],back?.[k]].map(Number).filter(Number.isFinite);
+    const vals=[front?.[k],back?.[k]].map(conditionNumber).filter(v=>v!==null);
     return vals.length===2?clampHalf(Math.min(...vals),1,10):null;
   };
   const defects={};
@@ -1326,6 +1704,7 @@ async function getMarket(env, identity, frontImage=null) {
       configured:true,live:true,items,rawItems,gradedItems,query,searchUrl,source:'eBay Browse API',environment:ebayEnvironment(env),
       stats:{raw:marketStats(rawItems),graded:marketStats(gradedItems)},
       refreshedAt:new Date().toISOString(),
+      queryStrategy:keyword.queries||[query],
       imageSearchUsed:Boolean(frontImage),
       ebay:{configured:true,environment:ebayEnvironment(env),items,query,searchUrl},
     };
@@ -1355,20 +1734,40 @@ async function getMarket(env, identity, frontImage=null) {
   return emptyMarket(identity);
 }
 
-async function ebayKeywordSearchWithToken(env, token, identity) {
-  const query=buildQuery(identity);
+
+function buildMarketQueries(identity={}){
+  const exact=buildQuery(identity);
+  const compact=[identity.year,identity.subject,identity.cardNo,identity.variation].filter(Boolean).join(' ').replace(/\s+/g,' ').trim();
+  const broad=[identity.subject,identity.cardNo].filter(Boolean).join(' ').replace(/\s+/g,' ').trim();
+  return [...new Set([exact,compact,broad].filter(Boolean))];
+}
+async function ebaySearchQueryWithToken(env,token,query,limit=30){
   const url=new URL(`${ebayApiBase(env)}/buy/browse/v1/item_summary/search`);
-  url.searchParams.set('q',query);
-  url.searchParams.set('limit','30');
+  url.searchParams.set('q',query);url.searchParams.set('limit',String(limit));
   const r=await fetch(url,{headers:{'Authorization':`Bearer ${token}`,'X-EBAY-C-MARKETPLACE-ID':'EBAY_US','Accept':'application/json'}});
-  if (!r.ok) {
+  if(!r.ok){
     const t=await r.text().catch(()=> '');
     throw new Error(`eBay Browse keyword search ${r.status}${t?`: ${t.slice(0,180)}`:''}`);
   }
   const data=await r.json();
-  return {items:(data.itemSummaries||[]).map(mapEbayItem)};
+  return (data.itemSummaries||[]).map(mapEbayItem);
 }
-
+async function ebayKeywordSearchWithToken(env, token, identity) {
+  const queries=buildMarketQueries(identity);
+  const merged=new Map();
+  const used=[];
+  for(const q of queries){
+    used.push(q);
+    const items=await ebaySearchQueryWithToken(env,token,q,30);
+    for(const x of items){
+      const key=x.itemId||x.url||x.title;
+      if(key&&!merged.has(key))merged.set(key,x);
+    }
+    const strong=[...merged.values()].map(x=>({...x,...scoreMarketItem(identity,x,false)})).filter(x=>x.matchScore>=75);
+    if(strong.length>=10)break;
+  }
+  return {items:[...merged.values()],queries:used};
+}
 async function ebayImageSearchWithToken(env, token, image) {
   const url=new URL(`${ebayApiBase(env)}/buy/browse/v1/item_summary/search_by_image`);
   url.searchParams.set('limit','30');
@@ -1506,6 +1905,8 @@ function marketStats(items) {
     trimmedHigh:+trimmed[trimmed.length-1].toFixed(2),
     value:+tMedian.toFixed(2),
     quality,
+    support:quality>=80?'strong':quality>=60?'moderate':quality>=40?'limited':'weak',
+    spreadRatio:+spread.toFixed(3),
     includesShipping:true,
   };
 }
@@ -1589,6 +1990,17 @@ function runSelfTests(){
     'front',85
   );
   add('condition consensus preserves conservative scores',merged.corners===9&&merged.surface===8.5&&merged.confidence>=60,merged);
+
+  const bogus=sanitizeConditionAssessment({side:'front',corners:1,edges:1,surface:1,focus:1,defects:{},confidence:90,centering:{lr:null,tb:null,confidence:0},notes:['No major visible defect flags']});
+  add('catastrophic placeholder condition scores fail closed',conditionCompleteness(bogus)===0&&bogus.confidence===0,bogus);
+  const emptyCombined=combineCondition(unknownConditionSide('front','unknown'),unknownConditionSide('back','unknown'),{front:80,back:80});
+  add('unknown condition values never coerce into score 1',emptyCombined.corners===null&&emptyCombined.edges===null&&emptyCombined.surface===null&&emptyCombined.focus===null,emptyCombined);
+
+  const hint=applyTrustedHint({cardNo:null,cardCandidates:[]},{cardNo:'91TF-2',year:2026,source:'test'});
+  add('local trusted fingerprint hint becomes a candidate, not a verdict',hint.cardCandidates?.[0]?.value==='91TF-2'&&hint.cardNo==='91TF-2',hint);
+
+  const mq=buildMarketQueries({year:2026,set:'Topps Flagship 1991 Topps Football',subject:'Travis Hunter',cardNo:'91TF-2',variation:null});
+  add('adaptive market search creates exact and safe broader queries',mq.length>=2&&mq[0].includes('91TF-2')&&mq.every(x=>x.includes('Travis Hunter')||x.includes('91TF-2')),mq);
 
   return {ok:tests.every(x=>x.pass),passed:tests.filter(x=>x.pass).length,total:tests.length,tests};
 }
