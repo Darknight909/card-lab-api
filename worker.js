@@ -1,10 +1,10 @@
-const VERSION = '6.0.0';
+const VERSION = '7.0.0';
 const DEFAULT_ORIGIN = 'https://darknight909.github.io';
 const CONDITION_PRIMARY_MODEL = '@cf/google/gemma-4-26b-a4b-it';
 const CONDITION_FALLBACK_MODEL = '@cf/moondream/moondream3.1-9B-A2B';
 const TEXT_MODEL = '@cf/meta/llama-3.3-70b-instruct-fp8-fast';
 const GOOGLE_VISION_URL = 'https://vision.googleapis.com/v1/images:annotate';
-const FEATURE_FLAGS = Object.freeze({referenceTemplates:true,stageCaching:true,targetedConditionConsensus:true,severityCondition:true,serialParallelGate:true,adaptiveMarket:true,strictMarketFiltering:true,localFingerprintHints:true,visionCenteringRescue:true,coreIdentityGate:true,failClosed:true});
+const FEATURE_FLAGS = Object.freeze({verifiedSourceFirst:true,strictExactCode:true,negativeEvidence:true,referenceTemplates:true,stageCaching:true,targetedConditionConsensus:true,severityCondition:true,serialParallelGate:true,adaptiveMarket:true,strictMarketFiltering:true,localFingerprintHints:true,referenceCenteringOnly:true,coreIdentityGate:true,fieldProvenance:true,failClosed:true});
 const PERFORMANCE_BUDGET_MS = Object.freeze({analysis:30000,identity:15000,condition:15000,reference:10000,market:8000});
 const TRUSTED_CARD_DOMAINS = [
   'topps.com','fanaticscollect.com','paniniamerica.net','upperdeck.com','leaftradingcards.com',
@@ -291,9 +291,9 @@ export default {
           results: (webLookup.results || []).slice(0, 10).map(x => ({ title:x.title, url:x.url, score:x.score, trustTier:x.trustTier, exactCode:x.exactCode })),
         },
         pipeline: {
-          identity: lockedIdentity ? 'Verified identity cache reused' : 'Normalized Google OCR/Web Detection → source hierarchy → serial/parallel arbitration → reference-image evidence graph',
-          condition: lockedCondition ? 'Validated condition stage cache reused' : 'Categorical severity vision → deterministic score mapping → second-model consensus only when needed → targeted arbitration',
-          centering: 'Local deterministic geometry first → independent vision rescue only when local geometry fails → fail closed on ambiguity',
+          identity: lockedIdentity ? 'Verified identity cache reused' : 'Physical OCR/visual clues → exact trusted online-source resolution → contradiction rejection → serial/parallel arbitration → provenance graph',
+          condition: lockedCondition ? 'Validated condition stage cache reused' : 'Moondream categorical condition → targeted missing-field retries → deterministic score mapping → Gemma arbitration only when needed',
+          centering: 'Local deterministic geometry first → verified exact-reference template only when needed → extreme/unverified vision results rejected',
           grading: 'Calculated locally from published grading standards/guidelines',
           market: market.live ? 'Official eBay Browse API adaptive exact→broader search + image matching + strict post-filtering' : 'Web-indexed fallback with strict identity filtering',
         },
@@ -492,6 +492,41 @@ function exactTokenPresent(text, token) {
   return new RegExp(`(^|[^A-Z0-9])${pattern}($|[^A-Z0-9])`,'i').test(t);
 }
 
+function strictCardCodePresent(text, token) {
+  const rawToken=String(token||'').toUpperCase().trim().replace(/^#/,'');
+  if(!rawToken)return false;
+  const target=normalizeLooseToken(rawToken);
+  const explicit=extractTrustedSourceCodes(String(text||''));
+  if(explicit.some(x=>normalizeLooseToken(x)===target))return true;
+
+  const parts=rawToken.split(/[-\s]+/).filter(Boolean).map(escapeRegex);
+  const core=parts.join('[-\\s#]*');
+  const re=new RegExp(`(^|[^A-Z0-9])${core}(?!\\s*[-/#]\\s*[A-Z0-9])($|[^A-Z0-9])`,'i');
+  return re.test(String(text||''));
+}
+function cardCodePrefix(a,b){
+  const A=normalizeLooseToken(a),B=normalizeLooseToken(b);
+  return Boolean(A&&B&&A!==B&&(B.startsWith(A)||A.startsWith(B)));
+}
+function chooseBestPhysicalCardCandidate(list=[]){
+  const a=[...(list||[])];
+  if(!a.length)return null;
+  a.sort((x,y)=>{
+    const xp=String(x?.value||''),yp=String(y?.value||'');
+    const xs=Number(x?.score||0),ys=Number(y?.score||0);
+    if(cardCodePrefix(xp,yp)&&Math.abs(xs-ys)<=85)return yp.length-xp.length;
+    return ys-xs || yp.length-xp.length;
+  });
+  return a[0]||null;
+}
+function sourceFullCodes(text){
+  const out=new Set(extractTrustedSourceCodes(text).map(x=>String(x).toUpperCase()));
+  for(const m of String(text||'').toUpperCase().match(/\b[A-Z0-9]{2,10}-[A-Z0-9]{1,8}(?:-[A-Z0-9]{1,8})?\b/g)||[]) {
+    if(isPlausibleCardCode(m,true)) out.add(m);
+  }
+  return [...out];
+}
+
 function isPlausibleCardCode(value, explicit=false) {
   const v=String(value||'').toUpperCase().replace(/^#/,'').trim().replace(/\s*-\s*/g,'-');
   if (!v || !/[0-9]/.test(v) || isDateLikeCardCode(v)) return false;
@@ -521,6 +556,11 @@ function extractCardCandidates(text) {
     const old = out.get(v);
     if (!old || old.score < score) out.set(v, { value:v, score, context:cleanLong(ctx.replace(/\s+/g,' '),130), origin:'ocr' });
   };
+
+  // OCR can split a card number at a line break, e.g. "91TF-" then "2".
+  for (const m of raw.matchAll(/\b([A-Z0-9]{2,10})\s*-\s*(?:\r?\n|\s{2,})([A-Z0-9]{1,8})\b/g)) {
+    add(`${m[1]}-${m[2]}`,165,m.index||0,true);
+  }
 
   // OCR often inserts spaces/newlines around hyphens; normalize those into one code.
   const hyphenated = /\b[A-Z0-9]{1,10}\s*-\s*[A-Z0-9]{1,10}(?:\s*-\s*[A-Z0-9]{1,8})?\b/g;
@@ -610,7 +650,7 @@ function provisionalFromGoogle(g) {
     brand,
     set: null,
     subject: null,
-    cardNo: candidates[0]?.value || null,
+    cardNo: chooseBestPhysicalCardCandidate(candidates)?.value || null,
     cardCandidates:candidates.slice(0,6),
     variation: null,
     team: null,
@@ -654,10 +694,13 @@ function domainTrust(url) {
   return 0;
 }
 
-function sourceEvidence(result, cardCode) {
+function sourceEvidence(result, cardCode, subjectHint=null) {
   const text = `${result.title||''} ${result.content||''}`;
-  const exactCode = cardCode ? exactTokenPresent(text,cardCode) : false;
-  return {...result, trustTier:domainTrust(result.url), exactCode, domain:hostnameOf(result.url)};
+  const exactCode = cardCode ? strictCardCodePresent(text,cardCode) : false;
+  const fullCodes=sourceFullCodes(text);
+  const codeConflict=Boolean(cardCode && fullCodes.length && !fullCodes.some(x=>normalizeLooseToken(x)===normalizeLooseToken(cardCode)));
+  const subjectMatch=subjectHint?containsSubject(text,subjectHint):null;
+  return {...result,trustTier:domainTrust(result.url),exactCode,fullCodes,codeConflict,subjectMatch,domain:hostnameOf(result.url)};
 }
 
 function extractSubjectFromTitle(title, cardNo, brand) {
@@ -677,103 +720,119 @@ function extractSubjectFromTitle(title, cardNo, brand) {
   return words.length>=2&&words.length<=5&&t.length<=60?t:null;
 }
 
-function likelySubjectFromGoogle(google, cardCode) {
-  const pages=collectGooglePages(google);
-  for (const p of pages) {
+function likelySubjectFromGoogle(google, cardCode=null) {
+  const ocr=allGoogleText(google);
+  const scored=new Map();
+  const add=(name,pts)=>{
+    name=clean(name);
+    if(!name)return;
+    const words=String(name).split(/\s+/).filter(Boolean);
+    if(words.length<2||words.length>5||name.length>60)return;
+    const key=normalizeTitle(name);
+    if(!key)return;
+    scored.set(key,{name,score:(scored.get(key)?.score||0)+pts});
+  };
+  for(const p of collectGooglePages(google)){
     const t=String(p.title||'');
-    if (cardCode && !exactTokenPresent(t,cardCode)) continue;
-    const s=extractSubjectFromTitle(t,cardCode,detectBrandFromText(t));
-    if (s) return s;
+    const sub=extractSubjectFromTitle(t,null,detectBrandFromText(t));
+    if(!sub)continue;
+    let pts=(p.fullMatches?10:p.partialMatches?5:2);
+    if(containsSubject(ocr,sub))pts+=16;
+    if(cardCode && strictCardCodePresent(t,cardCode))pts+=6;
+    add(sub,pts);
   }
-  const labels=[...(google?.front?.web?.bestGuessLabels||[]),...(google?.back?.web?.bestGuessLabels||[])];
-  for (const t of labels) {
-    const s=extractSubjectFromTitle(t,cardCode,detectBrandFromText(t));
-    if (s) return s;
+  for(const t of [...(google?.front?.web?.bestGuessLabels||[]),...(google?.back?.web?.bestGuessLabels||[])]){
+    const sub=extractSubjectFromTitle(t,null,detectBrandFromText(t));
+    if(sub)add(sub,containsSubject(ocr,sub)?12:3);
   }
-  return null;
+  for(const e of [...(google?.front?.web?.entities||[]),...(google?.back?.web?.entities||[])]){
+    const sub=extractSubjectFromTitle(e?.description||'',null,detectBrandFromText(e?.description||''));
+    if(sub)add(sub,containsSubject(ocr,sub)?8:2);
+  }
+  return [...scored.values()].sort((a,b)=>b.score-a.score)[0]?.name||null;
 }
 
 async function trustedCardLookup(env, provisional, google) {
-  const candidates = (provisional.cardCandidates || []).slice(0,3);
-  const brand = provisional.brand || '';
-  const likelySubject = likelySubjectFromGoogle(google,candidates[0]?.value);
-  const queries=[];
-  const merged=new Map();
+  const physicalCandidates=(provisional.cardCandidates||[]).slice(0,5);
+  const bestPhysical=chooseBestPhysicalCardCandidate(physicalCandidates);
+  const brand=provisional.brand||'';
+  const subjectHint=likelySubjectFromGoogle(google,bestPhysical?.value||provisional.cardNo);
+  const merged=new Map(),queries=[];
 
-  for (const cand of candidates) {
-    const q=[`"${cand.value}"`, likelySubject?`"${likelySubject}"`:'', brand, 'trading card checklist'].filter(Boolean).join(' ');
-    queries.push(q);
-    const batch=await tavilySearch(env,q,10,TRUSTED_CARD_DOMAINS);
-    for (const x of batch.results||[]) {
-      const y=sourceEvidence(x,cand.value);
+  const addResults=(batch,code)=>{
+    for(const x of batch?.results||[]){
+      const y=sourceEvidence(x,code,subjectHint);
       const key=y.url||`${y.title}|${y.content}`;
-      if (!merged.has(key) || (merged.get(key).score||0)<(y.score||0)) merged.set(key,y);
+      const prior=merged.get(key);
+      const weight=(y.trustTier||0)*100+(y.exactCode?70:0)+(y.subjectMatch?45:0)-(y.codeConflict?80:0)+(y.score||0)*10;
+      const priorWeight=prior?((prior.trustTier||0)*100+(prior.exactCode?70:0)+(prior.subjectMatch?45:0)-(prior.codeConflict?80:0)+(prior.score||0)*10):-Infinity;
+      if(!prior||weight>priorWeight)merged.set(key,y);
     }
-    let exactStrong=[...merged.values()].filter(x=>x.exactCode&&x.trustTier>=3);
-    let domains=new Set(exactStrong.map(x=>x.domain));
+  };
 
-    // A broad search can over-rank price aggregators. If exact-card corroboration
-    // is still weak, explicitly probe independent checklist/reference domains.
-    if (domains.size<2 && likelySubject) {
-      const focused=[
-        ['tcdb.com'],
-        ['beckett.com'],
-        ['cardboardconnection.com','cardboardchecklist.com'],
-        ['topps.com','fanaticscollect.com','paniniamerica.net','upperdeck.com','leaftradingcards.com'],
-      ];
-      const fq=`"${cand.value}" "${likelySubject}" trading card`;
-      const batches=await Promise.all(focused.map(ds=>tavilySearch(env,fq,5,ds).catch(()=>({results:[]}))));
-      for (const batch of batches) for (const x of batch.results||[]) {
-        const y=sourceEvidence(x,cand.value);
-        const key=y.url||`${y.title}|${y.content}`;
-        if (!merged.has(key) || (merged.get(key).score||0)<(y.score||0)) merged.set(key,y);
-      }
-      exactStrong=[...merged.values()].filter(x=>x.exactCode&&x.trustTier>=3);
-      domains=new Set(exactStrong.map(x=>x.domain));
-    }
-    if (domains.size>=2 || exactStrong.some(x=>x.trustTier===4)) break;
+  for(const cand of physicalCandidates.slice(0,3)){
+    const q=[subjectHint?`"${subjectHint}"`:'',`"${cand.value}"`,brand,'trading card checklist'].filter(Boolean).join(' ');
+    queries.push(q);
+    addResults(await tavilySearch(env,q,10,TRUSTED_CARD_DOMAINS),cand.value);
+
+    const focused=[
+      ['topps.com','fanaticscollect.com','paniniamerica.net','upperdeck.com','leaftradingcards.com'],
+      ['tcdb.com'],
+      ['beckett.com'],
+      ['cardboardconnection.com','cardboardchecklist.com'],
+    ];
+    const fq=[subjectHint?`"${subjectHint}"`:'',`"${cand.value}"`,'trading card'].filter(Boolean).join(' ');
+    const batches=await Promise.all(focused.map(ds=>tavilySearch(env,fq,6,ds).catch(()=>({results:[]}))));
+    for(const b of batches)addResults(b,cand.value);
   }
 
-  if (!merged.size) {
-    const title=collectGooglePages(google)[0]?.title || provisional.bestGuess || '';
-    if (title) {
-      const q=`${title} trading card checklist`;
-      queries.push(q);
-      const batch=await tavilySearch(env,q,10,TRUSTED_CARD_DOMAINS);
-      for (const x of batch.results||[]) merged.set(x.url||x.title,sourceEvidence(x,provisional.cardNo));
-    }
+  const prefix=bestPhysical?.value||provisional.cardNo;
+  if(subjectHint&&prefix){
+    const q=`"${subjectHint}" "${prefix}" trading card`;
+    queries.push(q);
+    addResults(await tavilySearch(env,q,12,TRUSTED_CARD_DOMAINS).catch(()=>({results:[]})),prefix);
+  }
+
+  if(!merged.size){
+    const q=[subjectHint?`"${subjectHint}"`:'',brand,collectGooglePages(google)[0]?.title||provisional.bestGuess||'','trading card checklist'].filter(Boolean).join(' ');
+    if(q.trim()){queries.push(q);addResults(await tavilySearch(env,q,10,TRUSTED_CARD_DOMAINS),prefix)}
   }
 
   const results=[...merged.values()].sort((a,b)=>{
-    const at=(a.trustTier||0)*100+(a.exactCode?70:0)+(a.score||0)*10;
-    const bt=(b.trustTier||0)*100+(b.exactCode?70:0)+(b.score||0)*10;
-    return bt-at;
-  }).slice(0,18);
-  return {configured:true,used:true,query:queries[0]||'',queries,answer:null,results};
+    const aw=(a.trustTier||0)*100+(a.exactCode?70:0)+(a.subjectMatch?45:0)-(a.codeConflict?80:0)+(a.score||0)*10;
+    const bw=(b.trustTier||0)*100+(b.exactCode?70:0)+(b.subjectMatch?45:0)-(b.codeConflict?80:0)+(b.score||0)*10;
+    return bw-aw;
+  }).slice(0,22);
+
+  return {configured:true,used:true,query:queries[0]||'',queries,answer:null,subjectHint,physicalCardCode:bestPhysical?.value||null,results};
 }
 
-function recoverTrustedCardCode(results, google) {
+function recoverTrustedCardCode(results, google, subjectHint=null, physicalCode=null) {
   const scored=new Map();
-  for (const r of results||[]) {
+  const add=(code,score,domain)=>{
+    if(!isPlausibleCardCode(code,true))return;
+    if(physicalCode && !cardCodePrefix(code,physicalCode) && normalizeLooseToken(code)!==normalizeLooseToken(physicalCode)) return;
+    const key=normalizeLooseToken(code);
+    const old=scored.get(key)||{code,score:0,domains:new Set()};
+    old.score+=score;
+    if(domain)old.domains.add(domain);
+    scored.set(key,old);
+  };
+  for(const r of results||[]){
+    const text=`${r.title||''} ${r.content||''}`;
+    if(subjectHint && !containsSubject(text,subjectHint))continue;
     const trust=Number(r.trustTier||domainTrust(r.url));
-    for (const code of extractTrustedSourceCodes(`${r.title||''} ${r.content||''}`)) {
-      const key=normalizeLooseToken(code);
-      const old=scored.get(key)||{code,score:0,domains:new Set()};
-      old.score += trust>=4?70:trust===3?55:trust===2?25:10;
-      if (r.url) old.domains.add(hostnameOf(r.url));
-      scored.set(key,old);
-    }
+    for(const code of sourceFullCodes(text))add(code,trust>=4?80:trust===3?60:trust===2?25:8,hostnameOf(r.url));
   }
-  for (const p of collectGooglePages(google)) {
-    for (const code of extractTrustedSourceCodes(p.title||'')) {
-      const key=normalizeLooseToken(code);
-      const old=scored.get(key)||{code,score:0,domains:new Set()};
-      old.score += (p.fullMatches?45:p.partialMatches?20:8);
-      scored.set(key,old);
-    }
+  for(const p of collectGooglePages(google)){
+    if(subjectHint && !containsSubject(p.title||'',subjectHint))continue;
+    for(const code of sourceFullCodes(p.title||''))add(code,p.fullMatches?45:p.partialMatches?20:6,hostnameOf(p.url));
   }
-  const ranked=[...scored.values()].sort((a,b)=>(b.score+b.domains.size*20)-(a.score+a.domains.size*20));
-  return ranked[0]?.code || null;
+  const ranked=[...scored.values()].sort((a,b)=>(b.score+b.domains.size*25)-(a.score+a.domains.size*25));
+  if(!ranked.length)return null;
+  const top=ranked[0],second=ranked[1];
+  if(second && (top.score+top.domains.size*25)-(second.score+second.domains.size*25)<25)return null;
+  return top.code;
 }
 
 function separateSetAndVariation(setName, variation, evidenceTexts, serialNumber) {
@@ -936,33 +995,43 @@ function resolveVariantEvidence(parsedVariation, serialNumber, sources, pages){
 }
 
 async function resolveIdentityFromSources(env, google, provisional, webLookup, frontImage=null, backImage=null) {
-  const candidates=(provisional.cardCandidates||[]).slice(0,5);
-  const trusted=(webLookup?.results||[]).map(x=>sourceEvidence(x,provisional.cardNo));
+  const candidates=(provisional.cardCandidates||[]).slice(0,6);
   const pages=collectGooglePages(google);
-  let selectedCode=null;
-  let selectedScore=-Infinity;
+  const physicalBest=chooseBestPhysicalCardCandidate(candidates);
+  const subjectHint=webLookup?.subjectHint||likelySubjectFromGoogle(google,physicalBest?.value||provisional.cardNo);
+  const trusted=(webLookup?.results||[]).map(x=>sourceEvidence(x,physicalBest?.value||provisional.cardNo,subjectHint));
 
-  for (const c of candidates) {
-    const exact=trusted.filter(x=>exactTokenPresent(`${x.title||''} ${x.content||''}`,c.value));
-    const unique=new Set(exact.map(x=>x.domain));
-    const tierPoints=exact.reduce((sum,x)=>sum+(x.trustTier>=4?5:x.trustTier===3?4:x.trustTier===2?2:0),0);
-    const gp=pages.filter(p=>exactTokenPresent(p.title||'',c.value));
-    const score=c.score + tierPoints*30 + unique.size*25 + gp.reduce((z,p)=>z+(p.fullMatches?25:p.partialMatches?8:3),0);
-    if (score>selectedScore){selectedScore=score;selectedCode=c.value;}
+  let selectedCode=physicalBest?.value||provisional.cardNo||null;
+  const sourceExpanded=recoverTrustedCardCode(trusted,google,subjectHint,selectedCode);
+  if(sourceExpanded && (!selectedCode || cardCodePrefix(sourceExpanded,selectedCode) || normalizeLooseToken(sourceExpanded)===normalizeLooseToken(selectedCode))) {
+    if(!selectedCode || String(sourceExpanded).length>=String(selectedCode).length) selectedCode=sourceExpanded;
   }
-  if (!selectedCode) selectedCode=provisional.cardNo;
-  if (!selectedCode) selectedCode=recoverTrustedCardCode(trusted,google);
+  const longerPhysical=candidates
+    .filter(x=>selectedCode&&cardCodePrefix(x.value,selectedCode)&&String(x.value).length>String(selectedCode).length)
+    .sort((a,b)=>b.score-a.score||String(b.value).length-String(a.value).length)[0];
+  if(longerPhysical && Number(longerPhysical.score||0)>=100) selectedCode=longerPhysical.value;
 
-  const exactSources=trusted.filter(x=>selectedCode&&exactTokenPresent(`${x.title||''} ${x.content||''}`,selectedCode));
-  const exactGooglePages=pages.filter(x=>selectedCode&&exactTokenPresent(x.title||'',selectedCode));
+  const exactSources=trusted.filter(x=>{
+    const text=`${x.title||''} ${x.content||''}`;
+    return selectedCode && strictCardCodePresent(text,selectedCode) && (!subjectHint || containsSubject(text,subjectHint));
+  });
+  const contradictorySources=trusted.filter(x=>{
+    const text=`${x.title||''} ${x.content||''}`;
+    const samePrefix=(x.fullCodes||[]).some(c=>selectedCode&&cardCodePrefix(c,selectedCode));
+    return samePrefix && (!strictCardCodePresent(text,selectedCode) || (subjectHint&&!containsSubject(text,subjectHint)));
+  });
+  const exactGooglePages=pages.filter(x=>selectedCode&&strictCardCodePresent(x.title||'',selectedCode)&&(!subjectHint||containsSubject(x.title||'',subjectHint)));
   const evidenceBundle={
     selectedCardCode:selectedCode,
+    subjectHint,
+    physicalCardCode:physicalBest?.value||null,
     serialNumber:provisional.serialNumber,
     ocrFront:cleanLong(google.front?.fullText||'',4200),
     ocrBack:cleanLong(google.back?.fullText||'',5200),
     exactTrustedSources:exactSources.slice(0,10).map((x,i)=>({index:i,title:x.title,url:x.url,content:x.content,trustTier:x.trustTier})),
     googleMatchingPages:exactGooglePages.slice(0,8),
     googleBestGuess:[...(google.front?.web?.bestGuessLabels||[]),...(google.back?.web?.bestGuessLabels||[])].slice(0,6),
+    contradictorySources:contradictorySources.slice(0,6).map(x=>({title:x.title,url:x.url,fullCodes:x.fullCodes,subjectMatch:x.subjectMatch})),
   };
 
   let parsed={};
@@ -970,7 +1039,9 @@ async function resolveIdentityFromSources(env, google, provisional, webLookup, f
     const prompt=`Extract the identity of ONE trading card using ONLY the listed source evidence. The source pages, not OCR guesses, are the authority. Return one JSON object only.
 
 Rules:
-- cardNo must be exactly the selectedCardCode if the sources support it.
+- The online trusted sources are authoritative. OCR and visual labels are lookup clues only.
+- cardNo must be exactly the selectedCardCode if the trusted sources support it.
+- subject must match subjectHint when the exact trusted sources support that same person/character.
 - year must be the product/release year shown by a trusted source, never a birth/statistics/design year.
 - set must preserve the actual product/set/insert wording from the sources, but exclude a color/parallel name when that parallel is separately identifiable.
 - subject is the player/character/person on that exact card number.
@@ -1041,26 +1112,28 @@ RETURN:
   const subjectSupported=Boolean(identity.subject && exactSources.some(x=>containsSubject(`${x.title||''} ${x.content||''}`,identity.subject)));
   const yearSupported=Boolean(identity.year && exactSources.some(x=>new RegExp(`\\b${identity.year}\\b`).test(`${x.title||''} ${x.content||''}`)));
   const setSupported=Boolean(identity.set && exactSources.some(x=>containsSet(`${x.title||''} ${x.content||''}`,identity.set)));
-  const codeSupported=Boolean(identity.cardNo && exactSources.some(x=>exactTokenPresent(`${x.title||''} ${x.content||''}`,identity.cardNo)));
+  const codeSupported=Boolean(identity.cardNo && exactSources.some(x=>strictCardCodePresent(`${x.title||''} ${x.content||''}`,identity.cardNo)));
 
   const physicalOcrText=`${google?.front?.fullText||''}\n${google?.back?.fullText||''}`;
-  const physicalCodeSupported=Boolean(identity.cardNo && exactTokenPresent(physicalOcrText,identity.cardNo));
+  const physicalCodeSupported=Boolean(identity.cardNo && strictCardCodePresent(physicalOcrText,identity.cardNo));
   const matchingImageSupport=Boolean(exactGooglePages.some(p=>(p.fullMatches||0)>0 || (p.partialMatches||0)>0));
+  const contradictionCount=contradictorySources.length;
 
   let verification_status='unverified';
   if (
     codeSupported && subjectSupported && yearSupported && setSupported &&
+    contradictionCount===0 &&
     (
       uniqueStrongDomains.size>=2 ||
-      (officialCount>=1 && strongCount>=1) ||
+      officialCount>=1 ||
       (strongCount>=1 && physicalCodeSupported && matchingImageSupport)
     )
   ) verification_status='verified';
   else if (
     codeSupported && subjectSupported && yearSupported && setSupported &&
-    ((strongCount>=1 && physicalCodeSupported) || (physicalCodeSupported && matchingImageSupport))
+    contradictionCount<=1 &&
+    (strongCount>=1 || (physicalCodeSupported && matchingImageSupport))
   ) verification_status='probable';
-  else if (codeSupported && subjectSupported && setSupported && (strongCount>=1 || physicalCodeSupported)) verification_status='probable';
 
   // Core card identity and variant identity are intentionally separate.
   // An unresolved parallel blocks market valuation, not the pre-grade pipeline.
@@ -1074,10 +1147,11 @@ RETURN:
   confidence+=Math.min(16,uniqueStrongDomains.size*8);
   confidence+=Math.min(8,officialCount*8);
   if (googleFull>0) confidence+=5;
+  confidence-=Math.min(30,contradictionCount*12);
   if (identity.set) confidence+=5;
   if (verification_status==='unverified') confidence=Math.min(confidence,69);
   if (verification_status==='probable') confidence=Math.min(confidence,84);
-  if (verification_status==='verified') confidence=Math.max(confidence,90);
+  if (verification_status==='verified') confidence=Math.max(confidence,92);
   if (variantResolution.status==='verified') confidence+=3;
   if (variantResolution.status==='unresolved') confidence=Math.min(confidence,84);
   confidence=clamp(Math.round(confidence),0,99);
@@ -1091,6 +1165,7 @@ RETURN:
   if (uniqueStrongDomains.size>=2) evidence.push(`${uniqueStrongDomains.size} independent established source domains agree on the exact card.`);
   if (physicalCodeSupported) evidence.push(`Physical-card OCR independently supports card code ${identity.cardNo}.`);
   if (matchingImageSupport) evidence.push('Google visual-web matching independently supports an exact-card page/image path.');
+  if (contradictionCount) evidence.push(`${contradictionCount} conflicting source result${contradictionCount===1?' was':'s were'} rejected as negative evidence.`);
   if (serialNumber) evidence.push(`Serial-number evidence detected on the card: ${serialNumber}${serialVision?' (targeted visual/OCR verification)':''}.`);
   if (variantResolution.status==='verified') evidence.push(`Parallel ${identity.variation} was tied to the detected serial denominator by trusted-source evidence.`);
   if (variantResolution.status==='unresolved') evidence.push('Parallel/variation was intentionally withheld because the evidence conflicts or is incomplete.');
@@ -1109,14 +1184,16 @@ RETURN:
     serialNumber:serialNumber?(serialVision?Math.max(90,serialVision.confidence):92):0,
   };
   const evidence_graph={
-    cardNo:{value:identity.cardNo,physicalOcr:physicalCodeSupported,matchingImageSupport,supportingDomains:[...new Set(exactSources.filter(x=>exactTokenPresent(`${x.title||''} ${x.content||''}`,identity.cardNo)).map(x=>x.domain))]},
+    cardNo:{value:identity.cardNo,physicalOcr:physicalCodeSupported,matchingImageSupport,supportingDomains:[...new Set(exactSources.filter(x=>strictCardCodePresent(`${x.title||''} ${x.content||''}`,identity.cardNo)).map(x=>x.domain))]},
     subject:{value:identity.subject,supportingDomains:[...new Set(exactSources.filter(x=>containsSubject(`${x.title||''} ${x.content||''}`,identity.subject)).map(x=>x.domain))]},
     year:{value:identity.year,supportingDomains:[...new Set(exactSources.filter(x=>identity.year&&new RegExp(`\\b${identity.year}\\b`).test(`${x.title||''} ${x.content||''}`)).map(x=>x.domain))]},
     set:{value:identity.set,supportingDomains:[...new Set(exactSources.filter(x=>containsSet(`${x.title||''} ${x.content||''}`,identity.set)).map(x=>x.domain))]},
     variation:{value:identity.variation,status:variantResolution.status,reason:variantResolution.reason,candidates:variantResolution.catalog.map(x=>({name:x.name,denominators:x.denominators,weight:x.weight})),visualArbitration:variantVisual?{candidate:variantVisual.candidate.name,confidence:variantVisual.confidence,cues:variantVisual.visible_cues}:null},
     serialNumber:{value:serialNumber,source:serialNumber?(serialVision?'targeted back-photo serial verifier':'physical-card OCR'):null,evidence:serialVision?.evidence||null},
+    provenance:{year:'trusted online source',set:'trusted online source',subject:'trusted online source',cardNo:'trusted online source + physical OCR clue',variation:identity.variation?'trusted source/serial or visual arbitration':'unresolved',serialNumber:serialNumber?(serialVision?'targeted visual OCR':'physical OCR'):'none'},
+    contradictions:contradictorySources.slice(0,8).map(x=>({title:x.title,url:x.url,fullCodes:x.fullCodes,subjectMatch:x.subjectMatch})),
   };
-  const reference_images=[...new Set(exactGooglePages.flatMap(p=>p.referenceImages||[]).filter(Boolean))].slice(0,8);
+  const reference_images=[...new Set(exactGooglePages.filter(p=>p.fullMatches>0 && p.trustTier>=2).flatMap(p=>p.referenceImages||[]).filter(Boolean))].slice(0,6);
 
   return {
     identity,
@@ -1313,6 +1390,58 @@ function mergeConditionConsensus(a,b,side,photoQuality) {
 }
 
 
+
+function parseSeverityKV(text,side,photoQuality){
+  const vals={};
+  for(const line of String(text||'').split(/\r?\n/)){
+    const m=line.trim().match(/^([A-Z_]+)\s*[:=]\s*(.*)$/i);
+    if(m)vals[m[1].toUpperCase()]=m[2].trim();
+  }
+  const obj={defects:[],confidence:Number(String(vals.CONFIDENCE||'').match(/\d+/)?.[0]||0)};
+  for(const k of ['CORNERS','EDGES','SURFACE','FOCUS']){
+    obj[k.toLowerCase()]={severity:normalizeConditionSeverity(vals[k]),evidence:clean(vals[k+'_EVIDENCE'])};
+  }
+  const def=String(vals.DEFECTS||'').toLowerCase();
+  if(def && !/\bnone\b/.test(def))obj.defects=def.split(/[,;|]/).map(x=>x.trim().replace(/[- ]/g,'_')).filter(Boolean);
+  obj.center_lr=vals.CENTER_LR||null;obj.center_tb=vals.CENTER_TB||null;
+  obj.center_confidence=Number(String(vals.CENTER_CONFIDENCE||'').match(/\d+/)?.[0]||0);
+  return conditionFromSeverityObject(obj,side,photoQuality,'Moondream categorical');
+}
+async function runMoondreamCategorical(env,side,image,photoQuality){
+  const q=`Inspect ONLY visible physical condition of the ${side} of this raw trading card.
+Answer EXACTLY these KEY=VALUE lines and nothing else:
+CORNERS=NONE|MINUTE|MINOR|MODERATE|MAJOR|SEVERE|UNKNOWN
+CORNERS_EVIDENCE=short visible evidence or NONE
+EDGES=NONE|MINUTE|MINOR|MODERATE|MAJOR|SEVERE|UNKNOWN
+EDGES_EVIDENCE=short visible evidence or NONE
+SURFACE=NONE|MINUTE|MINOR|MODERATE|MAJOR|SEVERE|UNKNOWN
+SURFACE_EVIDENCE=short visible evidence or NONE
+FOCUS=NONE|MINUTE|MINOR|MODERATE|MAJOR|SEVERE|UNKNOWN
+FOCUS_EVIDENCE=short visible evidence or NONE
+DEFECTS=NONE or comma-separated crease,dent,stain,scratch,printline,mark,possible_alteration
+CONFIDENCE=0-100
+CENTER_LR=UNKNOWN
+CENTER_TB=UNKNOWN
+CENTER_CONFIDENCE=0
+Rules: do not identify the card; do not use camera blur as card focus; UNKNOWN rather than guessing; MODERATE or worse requires named visible evidence.`;
+  try{
+    const raw=await env.AI.run(CONDITION_FALLBACK_MODEL,{task:'query',image,question:q,reasoning:false,temperature:0,max_tokens:700,stream:false});
+    return parseSeverityKV(modelText(raw),side,photoQuality);
+  }catch(e){console.warn('Moondream categorical:',e);return null}
+}
+async function runMoondreamTargetedField(env,side,image,field){
+  const label=field.toUpperCase();
+  const q=`Inspect ONLY the ${field} condition on the ${side} of this raw trading card.
+Return EXACTLY:
+${label}=NONE|MINUTE|MINOR|MODERATE|MAJOR|SEVERE|UNKNOWN
+${label}_EVIDENCE=short visible evidence or NONE
+Do not identify the card. UNKNOWN rather than guessing. MODERATE or worse requires named visible evidence.`;
+  try{
+    const raw=await env.AI.run(CONDITION_FALLBACK_MODEL,{task:'query',image,question:q,reasoning:false,temperature:0,max_tokens:220,stream:false});
+    const vals={};for(const line of modelText(raw).split(/\r?\n/)){const m=line.trim().match(/^([A-Z_]+)\s*[:=]\s*(.*)$/i);if(m)vals[m[1].toUpperCase()]=m[2].trim()}
+    return {severity:normalizeConditionSeverity(vals[label]),evidence:clean(vals[label+'_EVIDENCE'])};
+  }catch{return {severity:'unknown',evidence:null}}
+}
 const CONDITION_SEVERITY_RANK=Object.freeze({none:0,minute:1,minor:2,moderate:3,major:4,severe:5,unknown:99});
 const CONDITION_SEVERITY_SCORE=Object.freeze({none:10,minute:9.5,minor:8.5,moderate:7.5,major:6,severe:4});
 
@@ -1451,51 +1580,41 @@ async function runSeverityArbitrator(env,side,image,photoQuality,fields){
 }
 
 async function inspectConditionSide(env, side, image, photoQuality=null) {
-  // v6 primary path: models classify severity; Card Lab maps severity to scores.
-  // This prevents model-specific numeric-scale failures such as 1/1/1/1 with no defects.
-  const primary=await runSeverityVision(env,CONDITION_PRIMARY_MODEL,side,image,photoQuality);
-  if(primary && !severityNeedsSecond(primary))return primary;
+  let primary=await runMoondreamCategorical(env,side,image,photoQuality);
 
-  const fallback=await runSeverityVision(env,CONDITION_FALLBACK_MODEL,side,image,photoQuality);
-  if(primary&&fallback){
-    let merged=mergeSeverityConsensus(primary,fallback,side,photoQuality);
-    if(merged?.disputedFields?.length){
-      const arb=await runSeverityArbitrator(env,side,image,photoQuality,merged.disputedFields);
-      if(arb){
-        for(const k of merged.disputedFields){
-          if(arb[k]!=null){
-            merged[k]=arb[k];
-            merged.severity[k]=arb.severity?.[k]||merged.severity[k];
-          }
+  if(primary && conditionCompleteness(primary)<4){
+    const missing=['corners','edges','surface','focus'].filter(k=>primary[k]==null);
+    const repaired=await Promise.all(missing.map(k=>runMoondreamTargetedField(env,side,image,k)));
+    for(let i=0;i<missing.length;i++){
+      const k=missing[i],r=repaired[i];
+      if(r?.severity&&r.severity!=='unknown'){
+        primary.severity=primary.severity||{};
+        primary.severity[k]=r.severity;
+        const rank=CONDITION_SEVERITY_RANK[r.severity];
+        if(rank<99&&(rank<3||r.evidence)){
+          primary[k]=CONDITION_SEVERITY_SCORE[r.severity];
+          if(r.evidence)primary.notes.push(`${k[0].toUpperCase()+k.slice(1)}: ${r.evidence}`);
         }
-        merged.notes=Array.from(new Set([...(merged.notes||[]),...(arb.notes||[]),'Targeted arbitration resolved only disputed condition categories.'])).slice(0,10);
-        if(conditionCompleteness(merged)===4)merged.confidence=clamp(Math.max(merged.confidence,62),0,92);
-        merged=sanitizeConditionAssessment(merged);
       }
     }
+    primary=sanitizeConditionAssessment(primary);
+    if(conditionCompleteness(primary)===4)primary.confidence=clamp(Math.max(Number(primary.confidence||0),68),0,90);
+  }
+
+  if(primary && conditionCompleteness(primary)===4 && !severityNeedsSecond(primary))return primary;
+
+  const gemma=await runSeverityVision(env,CONDITION_PRIMARY_MODEL,side,image,photoQuality);
+  if(primary&&gemma){
+    const merged=mergeSeverityConsensus(primary,gemma,side,photoQuality);
+    if(conditionCompleteness(merged)===4)merged.confidence=clamp(Math.max(Number(merged.confidence||0),64),0,92);
     return merged;
   }
-  const best=primary||fallback;
+  const best=primary||gemma;
   if(best){
     if(conditionCompleteness(best)<4)best.confidence=Math.min(Number(best.confidence||0),34);
     return sanitizeConditionAssessment(best);
   }
-
-  // Last-resort compatibility path: retain the older numeric parser only if both
-  // categorical vision paths were unavailable.
-  const question=`Inspect ONLY visible physical condition of the ${side} of one raw trading card.
-Return ONLY JSON {"corners":number|null,"edges":number|null,"surface":number|null,"focus":number|null,"defects":[],"confidence":number,"center_lr":string|null,"center_tb":string|null,"center_confidence":number,"notes":[]}.
-Scores are 1-10; never use 1 as a placeholder; below 7 requires named visible damage; unknown values must be null.`;
-  try{
-    const r=await runConditionPrimary(env,side,image,question);
-    const legacy=sanitizeConditionAssessment(parseConditionFlexible(r.text,side));
-    if(legacy){
-      legacy.modelPath='legacy numeric emergency fallback';
-      legacy.confidence=Math.min(calibrateConditionConfidence(legacy,photoQuality,null),55);
-      return legacy;
-    }
-  }catch(e){console.warn('Emergency numeric condition fallback:',e)}
-  return unknownConditionSide(side,'All condition-vision paths were unavailable.');
+  return unknownConditionSide(side,'Condition vision could not produce a reliable categorical assessment.');
 }
 
 
@@ -1573,6 +1692,7 @@ Do not grade the reference card and do not infer the photographed user's card co
       const obj=structuredModelResult(raw,'reference template');
       return {
         sourceUrl:safeRemoteImageUrl(u),
+        verifiedExactIdentity:true,
         border_style:['framed','borderless','mixed','unknown'].includes(obj?.border_style)?obj.border_style:'unknown',
         measurable_frame:Boolean(obj?.measurable_frame),
         intentional_design_marks:Array.isArray(obj?.intentional_design_marks)?obj.intentional_design_marks.map(clean).filter(Boolean).slice(0,8):[],
@@ -1641,33 +1761,15 @@ Ignore the physical photo background and internal artwork lines. Return ONLY JSO
     const raw=await env.AI.run(CONDITION_PRIMARY_MODEL,{messages:[{role:'system',content:'Measure only true printed-frame centering; fail closed when no measurable frame exists.'},{role:'user',content:prompt}],image,temperature:0,max_tokens:400,stream:false});
     const obj=structuredModelResult(raw,'reference centering');
     const lr=parsePair(obj?.lr),tb=parsePair(obj?.tb),confidence=clamp(Math.round(Number(obj?.confidence)||0),0,100);
-    if(!lr||!tb||confidence<65)return null;
-    return {lr,tb,confidence,reason:clean(obj?.reason)||'reference-template visual centering'};
+    if(!lr||!tb||confidence<78)return null;
+    const worst=Math.max(...lr,...tb);
+    if(worst>68)return null;
+    return {lr,tb,confidence,verifiedReference:true,source:'verified-reference-template',reason:clean(obj?.reason)||'verified reference-template centering'};
   }catch(e){console.warn('Reference centering:',e);return null}
 }
 async function inspectCenteringIndependent(env,side,image,identity,template=null){
-  const ref=template?`Verified design template: ${JSON.stringify({border_style:template.border_style,measurable_frame:template.measurable_frame,notes:template.notes})}`:'No verified reference template is available.';
-  const prompt=`Measure ONLY printed-design centering on the ${side} of this photographed trading card.
-Known core identity: ${JSON.stringify({year:identity?.year,set:identity?.set,subject:identity?.subject,cardNo:identity?.cardNo})}
-${ref}
-
-First locate the physical card rectangle. Then locate the intended OUTERMOST printed frame/border. Ignore photo background, shadows, internal artwork boxes, logos, stat boxes, and decorative inner lines.
-Return ONLY JSON {"measurable":boolean,"lr":"55/45"|null,"tb":"52/48"|null,"confidence":number,"reason":string}.
-If borderless, ambiguous, perspective-distorted, or the outer printed frame cannot be distinguished, measurable=false.
-Do not guess.`;
-  try{
-    const raw=await env.AI.run(CONDITION_PRIMARY_MODEL,{messages:[
-      {role:'system',content:'You are a conservative card-geometry measurer. Use only the true outer printed frame and fail closed when ambiguous.'},
-      {role:'user',content:prompt}
-    ],image,temperature:0,max_tokens:450,stream:false});
-    const obj=structuredModelResult(raw,'independent centering');
-    if(!obj?.measurable)return null;
-    const lr=parsePair(obj.lr),tb=parsePair(obj.tb),confidence=clamp(Math.round(Number(obj.confidence)||0),0,100);
-    if(!lr||!tb||confidence<76)return null;
-    const extreme=Math.max(...lr,...tb)>70;
-    if(extreme&&confidence<90)return null;
-    return {lr,tb,confidence,reason:clean(obj.reason)||'independent vision geometry'};
-  }catch(e){console.warn('Independent centering:',e);return null}
+  if(!template?.measurable_frame || template?.border_style==='borderless')return null;
+  return inspectCenteringWithTemplate(env,side,image,template);
 }
 
 async function rescueCenteringEvidence(env,front,back,condition,identity,template,localCentering){
@@ -2204,6 +2306,11 @@ function runSelfTests(){
 
   const bogus=sanitizeConditionAssessment({side:'front',corners:1,edges:1,surface:1,focus:1,defects:{},confidence:90,centering:{lr:null,tb:null,confidence:0},notes:['No major visible defect flags']});
   add('catastrophic placeholder condition scores fail closed',conditionCompleteness(bogus)===0&&bogus.confidence===0,bogus);
+
+  add('short card-code prefix cannot verify a longer different card',strictCardCodePresent('2026 Topps Brock Bowers #91TF-34','91TF')===false,null);
+  add('full exact card code verifies correctly',strictCardCodePresent('2026 Topps Travis Hunter #91TF-2','91TF-2')===true,null);
+  const chosen=chooseBestPhysicalCardCandidate([{value:'91TF',score:150},{value:'91TF-2',score:145}]);
+  add('longer physical code is preserved over a near-equal prefix',chosen?.value==='91TF-2',chosen);
   const emptyCombined=combineCondition(unknownConditionSide('front','unknown'),unknownConditionSide('back','unknown'),{front:80,back:80});
   add('unknown condition values never coerce into score 1',emptyCombined.corners===null&&emptyCombined.edges===null&&emptyCombined.surface===null&&emptyCombined.focus===null,emptyCombined);
 

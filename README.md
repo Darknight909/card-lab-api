@@ -1,4 +1,4 @@
-# Card Lab Cloudflare Worker v6.0.0
+# Card Lab Cloudflare Worker v7.0.0
 
 Card Lab API 5.0 is a stage-isolated optimization release. It preserves the v4 evidence-gated identity and market architecture while adding reference-assisted analysis, targeted retries, and stronger fail-closed validation.
 
@@ -82,3 +82,13 @@ After deployment, Card Lab → Settings → Test connection should report API `v
 - Exact-card source lookup explicitly probes independent checklist/reference domains when a broad search returns only an aggregator.
 - Local centering remains first choice. A dedicated independent geometry pass can rescue centering only when local geometry fails and confidence is high.
 - Market valuation remains fail-closed when the variant is unresolved.
+
+## v7.0.0 verified-source-first release
+- Final identity fields come from trusted online sources; OCR and visual-web evidence are lookup clues only.
+- Short card-number prefixes can no longer verify longer unrelated card numbers.
+- Trusted-source results must match the full card number and subject; conflicting results are negative evidence.
+- A longer physical/source-proven card number cannot be silently shortened later.
+- Field provenance and source contradictions are retained in the evidence graph.
+- Reference images are accepted only from exact-card, full-match, established-source paths.
+- Centering cannot be rescued by a single vision guess without a verified exact-card reference template.
+- Condition uses Moondream categorical inspection first, targeted retries only for missing fields, and Gemma arbitration only when needed.
