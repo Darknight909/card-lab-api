@@ -1,11 +1,11 @@
-const VERSION = '8.0.0';
+const VERSION = '9.0.0';
 const DEFAULT_ORIGIN = 'https://darknight909.github.io';
 const CONDITION_PRIMARY_MODEL = '@cf/google/gemma-4-26b-a4b-it';
 const CONDITION_FALLBACK_MODEL = '@cf/moondream/moondream3.1-9B-A2B';
-const CONDITION_REGION_MODEL = '@cf/meta/llama-3.2-11b-vision-instruct';
+const CONDITION_REGION_MODEL = '@cf/google/gemma-4-26b-a4b-it';
 const TEXT_MODEL = '@cf/meta/llama-3.3-70b-instruct-fp8-fast';
 const GOOGLE_VISION_URL = 'https://vision.googleapis.com/v1/images:annotate';
-const FEATURE_FLAGS = Object.freeze({verifiedSourceFirst:true,sourceHierarchy:true,strictExactCode:true,negativeEvidence:true,frontBackPairCheck:true,referenceTemplates:true,referenceFrameDetection:true,regionConditionSheets:true,stageCaching:true,targetedConditionConsensus:true,severityCondition:true,serialParallelGate:true,adaptiveMarket:true,strictMarketFiltering:true,localFingerprintHints:true,coreIdentityGate:true,fieldProvenance:true,finalIntegrityGate:true,failClosed:true});
+const FEATURE_FLAGS = Object.freeze({verifiedSourceFirst:true,sourceHierarchy:true,strictExactCode:true,negativeEvidence:true,frontBackPairCheck:true,referenceTemplates:true,referenceFrameDetection:true,nestedCardFrameGeometry:true,regionConditionSheets:true,stageCaching:true,targetedConditionConsensus:true,severityCondition:true,licenseFreeConditionFallback:true,serialParallelGate:true,adaptiveMarket:true,strictMarketFiltering:true,localFingerprintHints:true,coreIdentityGate:true,fieldProvenance:true,finalIntegrityGate:true,failClosed:true});
 const PERFORMANCE_BUDGET_MS = Object.freeze({analysis:30000,identity:15000,condition:15000,reference:10000,market:8000});
 const TRUSTED_CARD_DOMAINS = [
   'topps.com','fanaticscollect.com','paniniamerica.net','upperdeck.com','leaftradingcards.com',
@@ -101,7 +101,7 @@ export default {
         conditionPrimaryModel: CONDITION_PRIMARY_MODEL,
         conditionFallbackModel: CONDITION_FALLBACK_MODEL,
         conditionRegionModel: CONDITION_REGION_MODEL,
-        architecture: 'verified-source identity + inspection-sheet condition + detected reference-frame centering + deterministic grading inputs + adaptive live market',
+        architecture: 'verified-source identity + structured inspection-sheet condition + nested card/frame centering + deterministic grading inputs + adaptive live market',
         featureFlags: FEATURE_FLAGS,
         performanceBudgetMs: PERFORMANCE_BUDGET_MS,
       }, 200, cors);
@@ -242,6 +242,13 @@ export default {
       }
       identityDurationMs = nowMs() - identityStarted;
 
+      if(!lockedIdentity && identityResult?.identity && (identityResult.sources||[]).length){
+        try{
+          const extraRefs=await discoverReferenceImagesFromSources(identityResult.sources,identityResult.identity);
+          identityResult.reference_images=[...new Set([...(identityResult.reference_images||[]),...extraRefs])].slice(0,8);
+        }catch{}
+      }
+
       let condition = await conditionPromise;
       let referenceTemplate=null;
       let referenceDurationMs=0;
@@ -321,8 +328,8 @@ export default {
         },
         pipeline: {
           identity: lockedIdentity ? 'Verified identity cache reused' : 'Physical OCR clues → strict full-card-number candidate → verified online-source hierarchy → front/back compatibility check → contradiction rejection → separate variant arbitration',
-          condition: lockedCondition ? 'Validated condition stage cache reused' : 'Labeled inspection-sheet crops → Moondream categorical severity → targeted retries → Llama vision corroboration only when needed → deterministic score mapping',
-          centering: 'Local deterministic geometry first → Moondream printed-frame detection → verified exact-reference frame comparison when available → extreme results rejected',
+          condition: lockedCondition ? 'Validated condition stage cache reused' : 'Labeled inspection-sheet crops → structured Gemma categorical inspection → Moondream one-field repair only when needed → deterministic score mapping',
+          centering: 'Local deterministic geometry first → nested physical-card + printed-frame detection → verified exact-reference comparison when available → suspicious perfect/extreme results rejected',
           grading: 'Calculated locally from published grading standards/guidelines',
           market: market.live ? 'Official eBay Browse API adaptive exact→broader search + image matching + strict post-filtering' : 'Web-indexed fallback with strict identity filtering',
         },
@@ -1583,6 +1590,30 @@ CENTER_LR=UNKNOWN
 CENTER_TB=UNKNOWN
 CENTER_CONFIDENCE=0`;
 }
+
+function severityWordFromText(text){
+  const m=String(text||'').toLowerCase().match(/\b(none|minute|minor|moderate|major|severe|unknown|clean|mint|tiny|trace|negligible|light|small|slight|medium|noticeable|heavy|significant|extreme|uncertain)\b/);
+  return normalizeConditionSeverity(m?.[1]||'unknown');
+}
+function evidenceFromLooseText(text){
+  const t=String(text||'').replace(/```/g,' ').replace(/\s+/g,' ').trim();
+  if(!t)return null;
+  const explicit=t.match(/EVIDENCE\s*[:=]\s*(.*)$/i)?.[1];
+  let cleaned=explicit!=null?explicit:t.replace(/^(?:severity\s*[:=]\s*)?(?:none|minute|minor|moderate|major|severe|unknown)\b[\s|:;,-]*/i,'');
+  cleaned=String(cleaned||'').replace(/^EVIDENCE\s*[:=]\s*/i,'').trim();
+  if(!cleaned||/^(none|unknown|n\/?a|null)$/i.test(cleaned))return null;
+  return clean(cleaned);
+}
+function defectsFromEvidence(notes=[]){
+  const joined=String((notes||[]).join(' ')).toLowerCase();
+  const out={};
+  for(const k of ['crease','dent','stain','scratch','printline','mark','possible_alteration']){
+    if(k==='printline')out[k]=/\bprint\s*line\b|\bprintline\b/.test(joined);
+    else if(k==='possible_alteration')out[k]=/\balter(?:ed|ation)\b|\btrimmed\b/.test(joined);
+    else out[k]=new RegExp(`\\b${k}\\b`,'i').test(joined);
+  }
+  return out;
+}
 function parseSeverityFlexible(text,side,photoQuality,modelPath){
   const raw=String(text||'').trim();
   if(raw){
@@ -1608,52 +1639,84 @@ async function runMoondreamCategorical(env,side,image,photoQuality){
     return parseSeverityFlexible(modelText(raw),side,photoQuality,'Moondream inspection-sheet categorical');
   }catch(e){console.warn('Moondream categorical:',e);return null}
 }
-async function runRegionLlamaCategorical(env,side,image,photoQuality){
+async function runRegionStructuredCategorical(env,side,image,photoQuality){
+  const schema={
+    type:'object',
+    properties:{
+      corners:{type:'object',properties:{severity:{type:'string'},evidence:{type:['string','null']}},required:['severity','evidence']},
+      edges:{type:'object',properties:{severity:{type:'string'},evidence:{type:['string','null']}},required:['severity','evidence']},
+      surface:{type:'object',properties:{severity:{type:'string'},evidence:{type:['string','null']}},required:['severity','evidence']},
+      focus:{type:'object',properties:{severity:{type:'string'},evidence:{type:['string','null']}},required:['severity','evidence']},
+      defects:{type:'array',items:{type:'string'}},
+      confidence:{type:'number'}
+    },
+    required:['corners','edges','surface','focus','defects','confidence']
+  };
   const prompt=`Inspect physical condition on the ${side} of a raw trading card.
 The image may be a Card Lab inspection sheet containing a full-card view plus enlarged labeled corner and edge crops from the SAME photograph. Use the labeled enlargements for corners/edges and the full-card view for surface and print registration.
 
-Classify each field as one of: none, minute, minor, moderate, major, severe, unknown.
-- none: no visible issue at this image resolution
-- minute: tiny issue visible only on close inspection
-- minor: small but clearly visible issue
-- moderate: obvious issue that would materially affect grade
-- major/severe: substantial damage
-- unknown: insufficient visual evidence
+For corners, edges, surface, and focus classify severity as exactly one of:
+none, minute, minor, moderate, major, severe, unknown.
 
-Do not identify the card. Do not assign numeric condition scores. Do not treat camera blur, glare, or background as card damage. Moderate or worse requires named visible evidence. Use unknown rather than guessing.
+Definitions:
+none = no visible issue at this image resolution
+minute = tiny issue visible only on close inspection
+minor = small but clearly visible issue
+moderate = obvious issue that materially affects grade
+major/severe = substantial damage
+unknown = insufficient visual evidence
 
-Return ONLY JSON:
-{"corners":{"severity":"none|minute|minor|moderate|major|severe|unknown","evidence":string|null},
-"edges":{"severity":"none|minute|minor|moderate|major|severe|unknown","evidence":string|null},
-"surface":{"severity":"none|minute|minor|moderate|major|severe|unknown","evidence":string|null},
-"focus":{"severity":"none|minute|minor|moderate|major|severe|unknown","evidence":string|null},
-"defects":["crease"|"dent"|"stain"|"scratch"|"printline"|"mark"|"possible_alteration"],
-"confidence":number}`;
+Do not identify the card. Do not assign numeric condition scores. Do not treat glare, camera blur, shadows, or background as damage.
+Moderate/major/severe must name the visible defect in evidence. Use unknown rather than guessing.`;
+
   try{
     const raw=await env.AI.run(CONDITION_REGION_MODEL,{
       messages:[
-        {role:'system',content:'You inspect visible trading-card condition. Use categorical severity only; unsupported fields must be unknown.'},
+        {role:'system',content:'Inspect only visible trading-card condition. Return structured categorical observations and fail closed on uncertainty.'},
         {role:'user',content:prompt}
       ],
-      image,temperature:0,max_tokens:850,stream:false
+      image,
+      response_format:{type:'json_schema',json_schema:schema},
+      temperature:0,
+      max_tokens:700,
+      stream:false
     });
-    return parseSeverityFlexible(modelText(raw),side,photoQuality,'Llama vision inspection-sheet categorical');
-  }catch(e){console.warn('Llama region condition:',e);return null}
+    let obj=null;
+    try{obj=structuredModelResult(raw,'structured condition')}catch{}
+    if(!obj){
+      const txt=modelText(raw);
+      try{obj=parseModelJSON(txt,'structured condition')}catch{}
+    }
+    const out=conditionFromSeverityObject(obj,side,photoQuality,'Gemma structured inspection-sheet categorical');
+    return sanitizeConditionAssessment(out);
+  }catch(e){
+    console.warn('Gemma structured condition:',e);
+    return null;
+  }
 }
 
 async function runMoondreamTargetedField(env,side,image,field){
-  const label=field.toUpperCase();
-  const q=`The image may be a Card Lab inspection sheet with a full-card view and enlarged labeled crops.
-Inspect ONLY the ${field} condition on the ${side} of the raw trading card.
-Return EXACTLY:
-${label}=NONE|MINUTE|MINOR|MODERATE|MAJOR|SEVERE|UNKNOWN
-${label}_EVIDENCE=short visible evidence or NONE
-Do not identify the card. UNKNOWN rather than guessing. MODERATE or worse requires named visible evidence.`;
+  const q=`Inspect ONLY the ${field} condition on the ${side} of this raw trading card.
+The image may contain a full-card view plus enlarged labeled crops from the SAME photograph.
+Respond on ONE LINE using this format:
+SEVERITY=<NONE|MINUTE|MINOR|MODERATE|MAJOR|SEVERE|UNKNOWN> | EVIDENCE=<short visible evidence or NONE>
+Do not identify the card. Do not assign a numeric grade. Ignore glare/background/camera blur. UNKNOWN rather than guessing.`;
   try{
-    const raw=await env.AI.run(CONDITION_FALLBACK_MODEL,{task:'query',image,question:q,reasoning:false,temperature:0,max_tokens:260,stream:false});
-    const vals={};for(const line of modelText(raw).split(/\r?\n/)){const m=line.trim().match(/^([A-Z_]+)\s*[:=]\s*(.*)$/i);if(m)vals[m[1].toUpperCase()]=m[2].trim()}
-    return {severity:normalizeConditionSeverity(vals[label]),evidence:clean(vals[label+'_EVIDENCE'])};
-  }catch{return {severity:'unknown',evidence:null}}
+    const raw=await env.AI.run(CONDITION_FALLBACK_MODEL,{
+      task:'query',image,question:q,reasoning:false,temperature:0,max_tokens:180,stream:false
+    });
+    const text=modelText(raw);
+    let severity=normalizeConditionSeverity(
+      text.match(/SEVERITY\s*[:=]\s*([A-Z]+)/i)?.[1] || severityWordFromText(text)
+    );
+    let evidence=clean(text.match(/EVIDENCE\s*[:=]\s*(.*)$/i)?.[1] || evidenceFromLooseText(text));
+    if(evidence&&/^(none|unknown|n\/?a|null)$/i.test(evidence))evidence=null;
+    if((CONDITION_SEVERITY_RANK[severity]??99)>=3&&!evidence)severity='unknown';
+    return {severity,evidence,raw:cleanLong(text,500)};
+  }catch(e){
+    console.warn(`Moondream targeted ${side} ${field}:`,e);
+    return {severity:'unknown',evidence:null,error:cleanError(e)};
+  }
 }
 
 const CONDITION_SEVERITY_RANK=Object.freeze({none:0,minute:1,minor:2,moderate:3,major:4,severe:5,unknown:99});
@@ -1798,61 +1861,56 @@ async function runSeverityArbitrator(env,side,image,photoQuality,fields){
 async function inspectConditionSide(env, side, image, photoQuality=null, inspectionImage=null) {
   const visual=inspectionImage||image;
 
-  // Pass 1: fast model on an inspection sheet/full photo.
-  let primary=await runMoondreamCategorical(env,side,visual,photoQuality);
+  // Pass 1: structured Gemma vision on the inspection sheet.
+  let primary=await runRegionStructuredCategorical(env,side,visual,photoQuality);
 
-  // Fill only fields the first pass could not judge. This is cheaper and more
-  // reliable than rerunning the whole card repeatedly.
-  if(primary && conditionCompleteness(primary)<4){
-    const missing=['corners','edges','surface','focus'].filter(k=>primary[k]==null);
-    const repaired=await Promise.all(missing.map(k=>runMoondreamTargetedField(env,side,visual,k)));
+  // Pass 2: Moondream asks one tiny question per unresolved category. This uses
+  // the documented query/answer interface and does not depend on another model license.
+  const missing=['corners','edges','surface','focus'].filter(k=>!primary||primary[k]==null);
+  if(missing.length){
+    if(!primary){
+      primary={side,defects:{crease:false,dent:false,stain:false,scratch:false,printline:false,mark:false,possible_alteration:false},
+        notes:[],severity:{},centering:{lr:null,tb:null,confidence:0},confidence:0,modelPath:'Moondream targeted categorical'};
+      for(const k of ['corners','edges','surface','focus'])primary[k]=null;
+    }
+    const targeted=await Promise.all(missing.map(k=>runMoondreamTargetedField(env,side,visual,k)));
     for(let i=0;i<missing.length;i++){
-      const k=missing[i],r=repaired[i];
-      if(r?.severity&&r.severity!=='unknown'){
-        const rank=CONDITION_SEVERITY_RANK[r.severity];
-        if(rank<99&&(rank<3||r.evidence)){
-          primary.severity=primary.severity||{};
-          primary.severity[k]=r.severity;
-          primary[k]=CONDITION_SEVERITY_SCORE[r.severity];
-          if(r.evidence&&String(r.evidence).toLowerCase()!=='none')primary.notes.push(`${k[0].toUpperCase()+k.slice(1)}: ${r.evidence}`);
-        }
+      const k=missing[i],r=targeted[i];
+      const rank=CONDITION_SEVERITY_RANK[r?.severity||'unknown']??99;
+      if(rank<99 && (rank<3 || r?.evidence)){
+        primary.severity[k]=r.severity;
+        primary[k]=CONDITION_SEVERITY_SCORE[r.severity];
+        if(r.evidence)primary.notes.push(`${k[0].toUpperCase()+k.slice(1)}: ${r.evidence}`);
       }
     }
+    const inferred=defectsFromEvidence(primary.notes);
+    primary.defects={...(primary.defects||{}),...Object.fromEntries(
+      Object.entries(inferred).map(([k,v])=>[k,Boolean(v||primary.defects?.[k])])
+    )};
     primary=sanitizeConditionAssessment(primary);
   }
 
-  const primaryComplete=primary&&conditionCompleteness(primary)===4;
-  const primaryNeedsCheck=!primaryComplete || Number(primary?.confidence||0)<64 ||
-    Object.values(primary?.defects||{}).some(Boolean) ||
-    ['corners','edges','surface','focus'].some(k=>(CONDITION_SEVERITY_RANK[primary?.severity?.[k]||'unknown']??99)>=2);
-
-  // Pass 2: documented Workers-AI vision model only when the first result needs
-  // corroboration. Models classify severity; Card Lab maps it to scores.
-  let secondary=null;
-  if(primaryNeedsCheck)secondary=await runRegionLlamaCategorical(env,side,visual,photoQuality);
-
-  if(primary&&secondary){
-    const merged=mergeSeverityConsensus(primary,secondary,side,photoQuality);
-    if(conditionCompleteness(merged)===4){
-      const q=Number.isFinite(Number(photoQuality))?Number(photoQuality):70;
-      merged.confidence=clamp(Math.max(Number(merged.confidence||0),q>=80?70:62),0,92);
-      merged.modelPath='Moondream + Llama inspection-sheet consensus';
-    }
-    return sanitizeConditionAssessment(merged);
+  // If all four categories are present, confidence is deterministic from image
+  // quality and evidence completeness, not from a model's self-reported confidence.
+  if(primary&&conditionCompleteness(primary)===4){
+    const q=Number.isFinite(Number(photoQuality))?clamp(Number(photoQuality),0,100):70;
+    const evidenceCount=(primary.notes||[]).length;
+    const anyDefect=Object.values(primary.defects||{}).some(Boolean);
+    let conf=60 + q*.22 + Math.min(10,evidenceCount*2);
+    if(anyDefect)conf-=3;
+    primary.confidence=clamp(Math.round(conf),62,92);
+    primary.modelPath=(primary.modelPath||'Gemma structured') + (missing.length?' + Moondream targeted repair':'');
+    return sanitizeConditionAssessment(primary);
   }
 
-  const best=primary||secondary;
-  if(best){
-    if(conditionCompleteness(best)===4){
-      const q=Number.isFinite(Number(photoQuality))?Number(photoQuality):70;
-      best.confidence=clamp(Math.max(Number(best.confidence||0),q>=80?68:58),0,90);
-    }else best.confidence=Math.min(Number(best.confidence||0),34);
-    return sanitizeConditionAssessment(best);
+  if(primary){
+    primary.confidence=Math.min(Number(primary.confidence||0),34);
+    primary.notes=Array.from(new Set([...(primary.notes||[]),'One or more condition categories remained unsupported after structured and targeted inspection.'])).slice(0,10);
+    return sanitizeConditionAssessment(primary);
   }
 
-  return unknownConditionSide(side,'Condition inspection models could not produce a supported categorical assessment.');
+  return unknownConditionSide(side,'Condition inspection could not produce supported observations.');
 }
-
 
 async function runConditionArbitrator(env,side,image,fields){
   if(!fields?.length)return null;
@@ -1924,43 +1982,62 @@ function normalizedDetectionBox(obj){
   const score=Number(obj?.score??obj?.confidence);
   return {xmin,ymin,xmax,ymax,score:Number.isFinite(score)?score:null,label:clean(obj?.label)};
 }
-function frameBoxMetrics(box){
-  if(!box)return null;
-  const L=box.xmin,R=1-box.xmax,T=box.ymin,B=1-box.ymax;
+function boxArea(box){return box?(box.xmax-box.xmin)*(box.ymax-box.ymin):0}
+function boxContains(outer,inner,tol=.015){
+  return Boolean(outer&&inner&&inner.xmin>=outer.xmin-tol&&inner.ymin>=outer.ymin-tol&&inner.xmax<=outer.xmax+tol&&inner.ymax<=outer.ymax+tol);
+}
+function frameWithinCardMetrics(card,frame){
+  if(!card||!frame||!boxContains(card,frame,.02))return null;
+  const cw=card.xmax-card.xmin,ch=card.ymax-card.ymin;
+  if(cw<=.05||ch<=.05)return null;
+  const L=(frame.xmin-card.xmin)/cw,R=(card.xmax-frame.xmax)/cw;
+  const T=(frame.ymin-card.ymin)/ch,B=(card.ymax-frame.ymax)/ch;
   const hsum=L+R,vsum=T+B;
-  if(hsum<=0.012||vsum<=0.012)return null; // likely physical card edge, not printed frame
-  if([L,R,T,B].some(v=>v<0||v>.34))return null;
+  if(hsum<=.018||vsum<=.018)return null;
+  if([L,R,T,B].some(v=>v<.004||v>.34))return null;
   const lr=[L/hsum*100,R/hsum*100],tb=[T/vsum*100,B/vsum*100];
   const worst=Math.max(...lr,...tb);
-  const area=(box.xmax-box.xmin)*(box.ymax-box.ymin);
+  const area=boxArea(frame)/boxArea(card);
   return {L,R,T,B,lr:lr.map(x=>+x.toFixed(1)),tb:tb.map(x=>+x.toFixed(1)),worst:+worst.toFixed(1),area:+area.toFixed(4)};
+}
+function suspiciousPerfectCentering(m){
+  if(!m)return true;
+  return Math.abs(m.lr[0]-50)<.15&&Math.abs(m.lr[1]-50)<.15&&Math.abs(m.tb[0]-50)<.15&&Math.abs(m.tb[1]-50)<.15;
+}
+async function detectBoxes(env,image,target,max_objects=8){
+  const raw=await env.AI.run(CONDITION_FALLBACK_MODEL,{task:'detect',image,target,max_objects,stream:false});
+  const objects=raw?.objects||raw?.result?.objects||[];
+  return objects.map(normalizedDetectionBox).filter(Boolean);
 }
 async function detectPrintedFrame(env,image){
   try{
-    const raw=await env.AI.run(CONDITION_FALLBACK_MODEL,{
-      task:'detect',
-      image,
-      target:'outer printed rectangular frame or border inside the trading card',
-      max_objects:8,
-      stream:false
-    });
-    const objects=raw?.objects||raw?.result?.objects||[];
+    const [cards,frames]=await Promise.all([
+      detectBoxes(env,image,'physical outer rectangular edges of the trading card',6),
+      detectBoxes(env,image,'outermost printed rectangular frame or border inside the trading card',10)
+    ]);
     const candidates=[];
-    for(const o of objects){
-      const box=normalizedDetectionBox(o),m=frameBoxMetrics(box);
-      if(!box||!m)continue;
-      if(m.area<0.28||m.area>0.96)continue;
-      const cx=(box.xmin+box.xmax)/2,cy=(box.ymin+box.ymax)/2;
-      const centerPenalty=Math.abs(cx-.5)+Math.abs(cy-.5);
-      const score=(Number.isFinite(box.score)?box.score:0.65)-centerPenalty*.6-Math.max(0,m.worst-65)/100;
-      candidates.push({box,metrics:m,rank:score});
+    for(const card of cards){
+      const cardArea=boxArea(card);
+      if(cardArea<.20||cardArea>.99)continue;
+      for(const frame of frames){
+        const metrics=frameWithinCardMetrics(card,frame);
+        if(!metrics)continue;
+        if(metrics.area<.30||metrics.area>.96)continue;
+        const cardScore=Number.isFinite(card.score)?card.score:.70;
+        const frameScore=Number.isFinite(frame.score)?frame.score:.68;
+        let rank=cardScore*.45+frameScore*.55-Math.max(0,metrics.worst-64)/120;
+        if(suspiciousPerfectCentering(metrics))rank-=.12;
+        candidates.push({cardBox:card,frameBox:frame,metrics,rank});
+      }
     }
     candidates.sort((a,b)=>b.rank-a.rank);
     const best=candidates[0];
     if(!best)return null;
-    const confidence=clamp(Math.round(((Number.isFinite(best.box.score)?best.box.score:.72)*100)-Math.max(0,best.metrics.worst-60)*1.2),0,96);
+    let confidence=clamp(Math.round(best.rank*100),0,95);
+    if(best.metrics.worst>68)confidence=Math.min(confidence,70);
+    if(suspiciousPerfectCentering(best.metrics))confidence=Math.min(confidence,72);
     if(confidence<65)return null;
-    return {...best.metrics,box:best.box,confidence,source:'Moondream object detection'};
+    return {...best.metrics,cardBox:best.cardBox,box:best.frameBox,confidence,source:'Moondream nested card/frame detection',suspiciousPerfect:suspiciousPerfectCentering(best.metrics)};
   }catch(e){console.warn('Printed-frame detection:',e);return null}
 }
 function framePatternDistance(a,b){
@@ -1971,23 +2048,54 @@ function frameCenteringResult(frame,{verifiedReference=false,referenceDistance=n
   if(!frame)return null;
   let confidence=Number(frame.confidence||0);
   if(verifiedReference){
-    if(!Number.isFinite(referenceDistance)||referenceDistance>.09)return null;
-    confidence=Math.min(95,confidence+Math.round((.09-referenceDistance)*120));
+    if(!Number.isFinite(referenceDistance)||referenceDistance>.075)return null;
+    confidence=Math.min(95,confidence+Math.round((.075-referenceDistance)*140));
   }else{
-    // Without a verified exact-card template, accept only ordinary-looking
-    // frame geometry. Extreme ratios remain fail-closed.
-    if(frame.worst>62||confidence<86)return null;
+    // Vision-only centering is corroborative, not authoritative. Never accept
+    // a suspicious perfect default or an extreme measurement without a verified reference.
+    if(frame.suspiciousPerfect||frame.worst>60||confidence<90)return null;
     confidence=Math.min(confidence,88);
   }
   if(frame.worst>68)return null;
   return {
     lr:frame.lr,tb:frame.tb,confidence,
     verifiedReference:Boolean(verifiedReference),
-    source:verifiedReference?'detected printed frame matched verified exact-card reference':'high-confidence printed-frame detection',
-    reason:verifiedReference?'detected outer frame geometry agrees with verified exact-card reference':'high-confidence outer printed frame detected independently'
+    source:verifiedReference?'nested printed frame matched verified exact-card reference':'high-confidence nested card/frame detection',
+    reason:verifiedReference?'printed-frame margins were measured inside the physical card and matched a verified exact-card reference':'printed-frame margins were measured inside the detected physical card'
   };
 }
 
+
+function htmlMetaImages(html,baseUrl){
+  const out=[];
+  const add=u=>{try{const x=new URL(String(u||'').replace(/&amp;/g,'&'),baseUrl);if(/^https?:$/.test(x.protocol))out.push(x.href)}catch{}};
+  for(const re of [
+    /<meta[^>]+property=["']og:image(?::secure_url)?["'][^>]+content=["']([^"']+)["']/ig,
+    /<meta[^>]+content=["']([^"']+)["'][^>]+property=["']og:image(?::secure_url)?["']/ig,
+    /<meta[^>]+name=["']twitter:image["'][^>]+content=["']([^"']+)["']/ig,
+    /<meta[^>]+content=["']([^"']+)["'][^>]+name=["']twitter:image["']/ig
+  ]){let m;while((m=re.exec(html)))add(m[1])}
+  return [...new Set(out)].slice(0,6);
+}
+async function discoverReferenceImagesFromSources(sources,identity){
+  const out=[];
+  for(const src of (sources||[]).slice(0,4)){
+    const titleUrl=`${src.title||''} ${src.url||''}`;
+    if(!strictCardCodePresent(titleUrl,identity?.cardNo)||!containsSubject(titleUrl,identity?.subject))continue;
+    try{
+      const controller=new AbortController();
+      const timer=setTimeout(()=>controller.abort(),2200);
+      const r=await fetch(src.url,{headers:{'User-Agent':'Mozilla/5.0 CardLab/9.0'},signal:controller.signal});
+      clearTimeout(timer);
+      if(!r.ok)continue;
+      const type=r.headers.get('content-type')||'';
+      if(!type.includes('text/html'))continue;
+      const html=(await r.text()).slice(0,500000);
+      out.push(...htmlMetaImages(html,src.url));
+    }catch{}
+  }
+  return [...new Set(out)].slice(0,8);
+}
 async function buildReferenceTemplate(env,urls,identity){
   for(const u of urls||[]){
     try{
@@ -2024,29 +2132,28 @@ async function inspectConditionWithTemplate(env,side,image,template,photoQuality
   const prompt=`Inspect ONLY visible physical condition on the ${side} of this raw trading card.
 A verified exact-card reference established these intentional design facts:
 ${JSON.stringify(template)}
-Do NOT count intentional printed/design features as damage and do NOT copy condition from the reference.
-
-Classify corners, edges, surface and print/focus as none, minute, minor, moderate, major, severe, or unknown.
-Return ONLY JSON:
-{"corners":{"severity":"none|minute|minor|moderate|major|severe|unknown","evidence":string|null},
-"edges":{"severity":"none|minute|minor|moderate|major|severe|unknown","evidence":string|null},
-"surface":{"severity":"none|minute|minor|moderate|major|severe|unknown","evidence":string|null},
-"focus":{"severity":"none|minute|minor|moderate|major|severe|unknown","evidence":string|null},
-"defects":["crease"|"dent"|"stain"|"scratch"|"printline"|"mark"|"possible_alteration"],
-"confidence":number}
-Use unknown rather than guessing. Moderate or worse requires named visible evidence.`;
+Do not count intentional printed/design features as damage and do not copy condition from the reference.
+For corners, edges, surface, and print/focus classify severity only as none, minute, minor, moderate, major, severe, or unknown.
+Use unknown rather than guessing. Moderate or worse requires named visible evidence.
+Return ONLY JSON with keys corners, edges, surface, focus, defects, confidence; each category must be {"severity":string,"evidence":string|null}.`;
   try{
-    const raw=await env.AI.run(CONDITION_REGION_MODEL,{
+    const raw=await env.AI.run(CONDITION_PRIMARY_MODEL,{
       messages:[
-        {role:'system',content:'Use the verified reference only to distinguish intentional design from physical damage. Use categorical severity only.'},
+        {role:'system',content:'Use the verified reference only as a design mask. Inspect the photographed card itself for physical condition.'},
         {role:'user',content:prompt}
       ],
-      image,temperature:0,max_tokens:800,stream:false
+      image,temperature:0,max_tokens:700,stream:false
     });
-    const out=parseSeverityFlexible(modelText(raw),side,photoQuality,'Llama vision + verified reference template');
+    let obj=null;
+    try{obj=structuredModelResult(raw,'reference condition')}catch{}
+    if(!obj){try{obj=parseModelJSON(modelText(raw),'reference condition')}catch{}}
+    const out=conditionFromSeverityObject(obj,side,photoQuality,'Gemma + verified reference template');
     if(out){
       out.notes=Array.from(new Set([...(out.notes||[]),'Verified exact-card reference was used only as a design mask.'])).slice(0,9);
-      if(conditionCompleteness(out)===4)out.confidence=clamp(Math.max(Number(out.confidence||0),65),0,90);
+      if(conditionCompleteness(out)===4){
+        const q=Number.isFinite(Number(photoQuality))?Number(photoQuality):70;
+        out.confidence=clamp(Math.round(62+q*.22+Math.min(8,(out.notes||[]).length*2)),62,92);
+      }
     }
     return sanitizeConditionAssessment(out);
   }catch(e){console.warn('Reference condition pass:',e);return null}
@@ -2687,11 +2794,15 @@ function runSelfTests(){
   },{subject:'Travis Hunter'});
   add('front/back conflicting full card numbers are rejected',pairConflict.status==='conflict',pairConflict);
 
-  const frame=frameBoxMetrics({xmin:.08,ymin:.06,xmax:.91,ymax:.94});
-  add('printed-frame box converts to sane centering ratios',Boolean(frame&&frame.worst<60&&frame.lr.length===2&&frame.tb.length===2),frame);
+  const legacyNested=frameWithinCardMetrics(
+    {xmin:.05,ymin:.03,xmax:.95,ymax:.97},
+    {xmin:.11,ymin:.09,xmax:.87,ymax:.89}
+  );
+  add('printed-frame margins are measured inside the physical card',Boolean(legacyNested&&legacyNested.worst<60&&legacyNested.lr.length===2&&legacyNested.tb.length===2),legacyNested);
 
-  const frameResult=frameCenteringResult({...frame,confidence:91},{verifiedReference:false});
-  add('high-confidence ordinary frame can rescue centering without guessing',Boolean(frameResult&&frameResult.confidence>=80),frameResult);
+  const ordinary={...legacyNested,confidence:93,suspiciousPerfect:suspiciousPerfectCentering(legacyNested)};
+  const frameResult=frameCenteringResult(ordinary,{verifiedReference:false});
+  add('high-confidence non-perfect nested frame can corroborate centering',Boolean(frameResult&&frameResult.confidence>=80&&!ordinary.suspiciousPerfect),frameResult);
 
   const sevKV=parseSeverityFlexible(`CORNERS=NONE
 CORNERS_EVIDENCE=sharp
@@ -2712,6 +2823,21 @@ CONFIDENCE=88`, 'front',95,'test-kv');
     condition_confidence:80,variant_status:'unresolved'
   });
   add('final integrity gate allows verified core with unresolved variant while flagging market hold',integrityGood.ok&&integrityGood.issues.some(x=>x.includes('market')),integrityGood);
+
+  const nested=frameWithinCardMetrics(
+    {xmin:.10,ymin:.05,xmax:.90,ymax:.95},
+    {xmin:.16,ymin:.12,xmax:.84,ymax:.88}
+  );
+  add('nested card/frame geometry measures margins relative to physical card',Boolean(nested&&nested.worst<56&&nested.area<.9),nested);
+
+  const perfect=frameWithinCardMetrics(
+    {xmin:.10,ymin:.05,xmax:.90,ymax:.95},
+    {xmin:.16,ymin:.12,xmax:.84,ymax:.88}
+  );
+  add('suspicious-perfect detector identifies exact 50/50 defaults',Boolean(perfect&&suspiciousPerfectCentering(perfect)),perfect);
+
+  const loose='SEVERITY=MINOR | EVIDENCE=tiny white speck visible on lower edge';
+  add('loose severity parser recovers categorical model output',severityWordFromText(loose)==='minor'&&/white speck/i.test(evidenceFromLooseText(loose)||''),{severity:severityWordFromText(loose),evidence:evidenceFromLooseText(loose)});
 
   return {ok:tests.every(x=>x.pass),passed:tests.filter(x=>x.pass).length,total:tests.length,tests};
 }

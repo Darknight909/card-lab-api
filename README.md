@@ -1,4 +1,4 @@
-# Card Lab Cloudflare Worker v8.0.0
+# Card Lab Cloudflare Worker v9.0.0
 
 Card Lab API 5.0 is a stage-isolated optimization release. It preserves the v4 evidence-gated identity and market architecture while adding reference-assisted analysis, targeted retries, and stronger fail-closed validation.
 
@@ -103,3 +103,11 @@ After deployment, Card Lab → Settings → Test connection should report API `v
 - Extreme centering remains fail-closed.
 - Final integrity checks prevent a verified identity, condition-ready state, or centering result from contradicting its underlying evidence.
 - Existing PSA/BGS/CGC/SGC grading rules are unchanged; this release improves the measurements fed into them.
+
+## v9.0.0 root-cause grading pipeline correction
+- Removed Meta Llama Vision from the condition pipeline, eliminating the separate Meta-license dependency.
+- Condition inspection now uses structured Gemma vision first and Moondream's documented query/answer interface only for unresolved individual fields.
+- Model self-reported numeric condition scores are not used; Card Lab maps categorical severity to grading inputs deterministically.
+- Centering now measures the printed frame *inside a separately detected physical card rectangle*, rather than relative to the photograph itself.
+- Exact 50/50-style detection defaults and extreme vision-only centering are rejected unless corroborated by a verified exact-card reference.
+- Card Lab can discover reference images from card-specific trusted source pages via OpenGraph/Twitter image metadata when Google Web Detection does not supply one.
