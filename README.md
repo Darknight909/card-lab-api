@@ -1,4 +1,4 @@
-# Card Lab Cloudflare Worker v5.0.0
+# Card Lab Cloudflare Worker v6.0.0
 
 Card Lab API 5.0 is a stage-isolated optimization release. It preserves the v4 evidence-gated identity and market architecture while adding reference-assisted analysis, targeted retries, and stronger fail-closed validation.
 
@@ -74,3 +74,11 @@ Replace these three files in the existing `card-lab-api` GitHub repository and c
 - `README.md`
 
 After deployment, Card Lab → Settings → Test connection should report API `v5.0.0`.
+
+## v6.0.0 optimization pass
+- Condition models now classify severity categories; Card Lab converts those categories to grading scores deterministically.
+- A second vision model is used only when the first result is uncertain, damaged, incomplete, or disputed.
+- Core identity verification is separated from parallel/variant verification. An unresolved parallel can block market value without unnecessarily blocking pre-grading of a verified core card.
+- Exact-card source lookup explicitly probes independent checklist/reference domains when a broad search returns only an aggregator.
+- Local centering remains first choice. A dedicated independent geometry pass can rescue centering only when local geometry fails and confidence is high.
+- Market valuation remains fail-closed when the variant is unresolved.

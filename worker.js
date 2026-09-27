@@ -1,10 +1,10 @@
-const VERSION = '5.0.0';
+const VERSION = '6.0.0';
 const DEFAULT_ORIGIN = 'https://darknight909.github.io';
 const CONDITION_PRIMARY_MODEL = '@cf/google/gemma-4-26b-a4b-it';
 const CONDITION_FALLBACK_MODEL = '@cf/moondream/moondream3.1-9B-A2B';
 const TEXT_MODEL = '@cf/meta/llama-3.3-70b-instruct-fp8-fast';
 const GOOGLE_VISION_URL = 'https://vision.googleapis.com/v1/images:annotate';
-const FEATURE_FLAGS = Object.freeze({referenceTemplates:true,stageCaching:true,targetedConditionConsensus:true,serialParallelGate:true,adaptiveMarket:true,strictMarketFiltering:true,localFingerprintHints:true,failClosed:true});
+const FEATURE_FLAGS = Object.freeze({referenceTemplates:true,stageCaching:true,targetedConditionConsensus:true,severityCondition:true,serialParallelGate:true,adaptiveMarket:true,strictMarketFiltering:true,localFingerprintHints:true,visionCenteringRescue:true,coreIdentityGate:true,failClosed:true});
 const PERFORMANCE_BUDGET_MS = Object.freeze({analysis:30000,identity:15000,condition:15000,reference:10000,market:8000});
 const TRUSTED_CARD_DOMAINS = [
   'topps.com','fanaticscollect.com','paniniamerica.net','upperdeck.com','leaftradingcards.com',
@@ -99,7 +99,7 @@ export default {
         workersAIConfigured: Boolean(env.AI),
         conditionPrimaryModel: CONDITION_PRIMARY_MODEL,
         conditionFallbackModel: CONDITION_FALLBACK_MODEL,
-        architecture: 'stage-isolated evidence graph + reference-assisted condition/centering + adaptive live market',
+        architecture: 'stage-isolated evidence graph + deterministic severity condition + dual-source identity verification + vision centering rescue + adaptive live market',
         featureFlags: FEATURE_FLAGS,
         performanceBudgetMs: PERFORMANCE_BUDGET_MS,
       }, 200, cors);
@@ -191,7 +191,8 @@ export default {
           identity: lockedIdentity,
           identity_confidence: clamp(Number(body.identityConfidence) || 98, 70, 100),
           verification_status: 'locked',
-          evidence: ['Previously verified identity reused; online identity lookup skipped for this re-analysis.'],
+          core_verification_status: 'locked',
+          evidence: ['Previously verified core identity reused; online identity lookup skipped for this re-analysis.'],
           sources: Array.isArray(body.identitySources) ? body.identitySources.slice(0,12) : [],
           needs_review: false,
           review_reason: null,
@@ -244,6 +245,7 @@ export default {
           condition=await refineCenteringWithReference(env,front,back,condition,referenceTemplate,localCentering);
         }
       }
+      condition=await rescueCenteringEvidence(env,front,back,condition,identityResult.identity,referenceTemplate,localCentering);
       referenceDurationMs=nowMs()-referenceStarted;
 
       const analysis = {
@@ -252,6 +254,7 @@ export default {
         identity_confidence: identityResult.identity_confidence,
         condition_confidence: condition.confidence,
         verification_status: identityResult.verification_status,
+        core_verification_status: identityResult.core_verification_status || identityResult.verification_status,
         sources: identityResult.sources || [],
         evidence: identityResult.evidence || [],
         selected_card_code: identityResult.selected_card_code || identityResult.identity?.cardNo || null,
@@ -289,8 +292,8 @@ export default {
         },
         pipeline: {
           identity: lockedIdentity ? 'Verified identity cache reused' : 'Normalized Google OCR/Web Detection → source hierarchy → serial/parallel arbitration → reference-image evidence graph',
-          condition: lockedCondition ? 'Validated condition stage cache reused' : 'Gemma 4 primary → Moondream dispute check → targeted arbitration → reference-template refinement only when needed',
-          centering: 'Local geometry first; extreme/uncertain measurements require independent vision/reference-template corroboration',
+          condition: lockedCondition ? 'Validated condition stage cache reused' : 'Categorical severity vision → deterministic score mapping → second-model consensus only when needed → targeted arbitration',
+          centering: 'Local deterministic geometry first → independent vision rescue only when local geometry fails → fail closed on ambiguity',
           grading: 'Calculated locally from published grading standards/guidelines',
           market: market.live ? 'Official eBay Browse API adaptive exact→broader search + image matching + strict post-filtering' : 'Web-indexed fallback with strict identity filtering',
         },
@@ -706,8 +709,28 @@ async function trustedCardLookup(env, provisional, google) {
       const key=y.url||`${y.title}|${y.content}`;
       if (!merged.has(key) || (merged.get(key).score||0)<(y.score||0)) merged.set(key,y);
     }
-    const exactStrong=[...merged.values()].filter(x=>x.exactCode&&x.trustTier>=3);
-    const domains=new Set(exactStrong.map(x=>x.domain));
+    let exactStrong=[...merged.values()].filter(x=>x.exactCode&&x.trustTier>=3);
+    let domains=new Set(exactStrong.map(x=>x.domain));
+
+    // A broad search can over-rank price aggregators. If exact-card corroboration
+    // is still weak, explicitly probe independent checklist/reference domains.
+    if (domains.size<2 && likelySubject) {
+      const focused=[
+        ['tcdb.com'],
+        ['beckett.com'],
+        ['cardboardconnection.com','cardboardchecklist.com'],
+        ['topps.com','fanaticscollect.com','paniniamerica.net','upperdeck.com','leaftradingcards.com'],
+      ];
+      const fq=`"${cand.value}" "${likelySubject}" trading card`;
+      const batches=await Promise.all(focused.map(ds=>tavilySearch(env,fq,5,ds).catch(()=>({results:[]}))));
+      for (const batch of batches) for (const x of batch.results||[]) {
+        const y=sourceEvidence(x,cand.value);
+        const key=y.url||`${y.title}|${y.content}`;
+        if (!merged.has(key) || (merged.get(key).score||0)<(y.score||0)) merged.set(key,y);
+      }
+      exactStrong=[...merged.values()].filter(x=>x.exactCode&&x.trustTier>=3);
+      domains=new Set(exactStrong.map(x=>x.domain));
+    }
     if (domains.size>=2 || exactStrong.some(x=>x.trustTier===4)) break;
   }
 
@@ -1020,10 +1043,28 @@ RETURN:
   const setSupported=Boolean(identity.set && exactSources.some(x=>containsSet(`${x.title||''} ${x.content||''}`,identity.set)));
   const codeSupported=Boolean(identity.cardNo && exactSources.some(x=>exactTokenPresent(`${x.title||''} ${x.content||''}`,identity.cardNo)));
 
+  const physicalOcrText=`${google?.front?.fullText||''}\n${google?.back?.fullText||''}`;
+  const physicalCodeSupported=Boolean(identity.cardNo && exactTokenPresent(physicalOcrText,identity.cardNo));
+  const matchingImageSupport=Boolean(exactGooglePages.some(p=>(p.fullMatches||0)>0 || (p.partialMatches||0)>0));
+
   let verification_status='unverified';
-  if (codeSupported && subjectSupported && yearSupported && setSupported && (uniqueStrongDomains.size>=2 || (officialCount>=1 && strongCount>=1))) verification_status='verified';
-  else if (codeSupported && subjectSupported && setSupported && strongCount>=1) verification_status='probable';
-  if (variantResolution.status==='unresolved' && verification_status==='verified') verification_status='probable';
+  if (
+    codeSupported && subjectSupported && yearSupported && setSupported &&
+    (
+      uniqueStrongDomains.size>=2 ||
+      (officialCount>=1 && strongCount>=1) ||
+      (strongCount>=1 && physicalCodeSupported && matchingImageSupport)
+    )
+  ) verification_status='verified';
+  else if (
+    codeSupported && subjectSupported && yearSupported && setSupported &&
+    ((strongCount>=1 && physicalCodeSupported) || (physicalCodeSupported && matchingImageSupport))
+  ) verification_status='probable';
+  else if (codeSupported && subjectSupported && setSupported && (strongCount>=1 || physicalCodeSupported)) verification_status='probable';
+
+  // Core card identity and variant identity are intentionally separate.
+  // An unresolved parallel blocks market valuation, not the pre-grade pipeline.
+  const core_verification_status=verification_status;
 
   let confidence=20;
   if (codeSupported) confidence+=30;
@@ -1048,14 +1089,16 @@ RETURN:
   if (yearSupported) evidence.push(`Product year ${identity.year} is sourced online rather than inferred from card statistics.`);
   if (setSupported) evidence.push(`Set/insert identity is supported by the trusted exact-card sources.`);
   if (uniqueStrongDomains.size>=2) evidence.push(`${uniqueStrongDomains.size} independent established source domains agree on the exact card.`);
+  if (physicalCodeSupported) evidence.push(`Physical-card OCR independently supports card code ${identity.cardNo}.`);
+  if (matchingImageSupport) evidence.push('Google visual-web matching independently supports an exact-card page/image path.');
   if (serialNumber) evidence.push(`Serial-number evidence detected on the card: ${serialNumber}${serialVision?' (targeted visual/OCR verification)':''}.`);
   if (variantResolution.status==='verified') evidence.push(`Parallel ${identity.variation} was tied to the detected serial denominator by trusted-source evidence.`);
   if (variantResolution.status==='unresolved') evidence.push('Parallel/variation was intentionally withheld because the evidence conflicts or is incomplete.');
 
   let reviewReason=null;
-  if (verification_status==='unverified') reviewReason='Exact identity could not be established from trusted online sources.';
-  else if (variantResolution.status==='unresolved') reviewReason=variantResolution.reason||'Parallel/variation needs additional evidence.';
-  else if (verification_status==='probable') reviewReason='Only one strong trusted-source path confirmed the exact card; additional corroboration is recommended.';
+  if (verification_status==='unverified') reviewReason='Exact core identity could not be established from trusted online sources.';
+  else if (variantResolution.status==='unresolved') reviewReason=variantResolution.reason||'Core identity is established; parallel/variation still needs additional evidence.';
+  else if (verification_status==='probable') reviewReason='Core identity is probable but additional corroboration is recommended.';
 
   const field_confidence={
     cardNo:codeSupported?clamp(88+uniqueStrongDomains.size*4,0,99):35,
@@ -1066,7 +1109,7 @@ RETURN:
     serialNumber:serialNumber?(serialVision?Math.max(90,serialVision.confidence):92):0,
   };
   const evidence_graph={
-    cardNo:{value:identity.cardNo,supportingDomains:[...new Set(exactSources.filter(x=>exactTokenPresent(`${x.title||''} ${x.content||''}`,identity.cardNo)).map(x=>x.domain))]},
+    cardNo:{value:identity.cardNo,physicalOcr:physicalCodeSupported,matchingImageSupport,supportingDomains:[...new Set(exactSources.filter(x=>exactTokenPresent(`${x.title||''} ${x.content||''}`,identity.cardNo)).map(x=>x.domain))]},
     subject:{value:identity.subject,supportingDomains:[...new Set(exactSources.filter(x=>containsSubject(`${x.title||''} ${x.content||''}`,identity.subject)).map(x=>x.domain))]},
     year:{value:identity.year,supportingDomains:[...new Set(exactSources.filter(x=>identity.year&&new RegExp(`\\b${identity.year}\\b`).test(`${x.title||''} ${x.content||''}`)).map(x=>x.domain))]},
     set:{value:identity.set,supportingDomains:[...new Set(exactSources.filter(x=>containsSet(`${x.title||''} ${x.content||''}`,identity.set)).map(x=>x.domain))]},
@@ -1081,7 +1124,8 @@ RETURN:
     verification_status,
     evidence,
     sources,
-    needs_review:verification_status!=='verified',
+    core_verification_status,
+    needs_review:verification_status!=='verified' || variantResolution.status==='unresolved',
     review_reason:reviewReason,
     selected_card_code:selectedCode,
     serial_number:serialNumber,
@@ -1268,64 +1312,190 @@ function mergeConditionConsensus(a,b,side,photoQuality) {
   return out;
 }
 
+
+const CONDITION_SEVERITY_RANK=Object.freeze({none:0,minute:1,minor:2,moderate:3,major:4,severe:5,unknown:99});
+const CONDITION_SEVERITY_SCORE=Object.freeze({none:10,minute:9.5,minor:8.5,moderate:7.5,major:6,severe:4});
+
+function normalizeConditionSeverity(v){
+  const x=String(v??'').toLowerCase().trim().replace(/[^a-z]/g,'');
+  if(!x||['unknown','uncertain','na','null','unjudgeable'].includes(x))return 'unknown';
+  if(['none','clean','mint','novisibleissue','nodefect'].includes(x))return 'none';
+  if(['minute','tiny','trace','negligible'].includes(x))return 'minute';
+  if(['minor','light','small','slight'].includes(x))return 'minor';
+  if(['moderate','medium','noticeable'].includes(x))return 'moderate';
+  if(['major','heavy','significant'].includes(x))return 'major';
+  if(['severe','extreme','verymajor'].includes(x))return 'severe';
+  return 'unknown';
+}
+function severityField(v){
+  if(v&&typeof v==='object'&&!Array.isArray(v)){
+    return {severity:normalizeConditionSeverity(v.severity??v.level??v.rating),evidence:clean(v.evidence??v.note??v.reason)};
+  }
+  return {severity:normalizeConditionSeverity(v),evidence:null};
+}
+function conditionFromSeverityObject(obj,side,photoQuality,modelPath='severity vision'){
+  if(!obj||typeof obj!=='object')return null;
+  const out={side,defects:{},notes:[],severity:{},centering:{lr:null,tb:null,confidence:0},modelPath};
+  let complete=0,evidenceCount=0;
+  for(const k of ['corners','edges','surface','focus']){
+    const f=severityField(obj[k]);
+    out.severity[k]=f.severity;
+    const rank=CONDITION_SEVERITY_RANK[f.severity];
+    if(rank!==99){
+      // Damage of moderate severity or worse requires the model to name what it saw.
+      if(rank>=3 && !f.evidence){
+        out[k]=null;
+        out.severity[k]='unknown';
+      }else{
+        out[k]=CONDITION_SEVERITY_SCORE[f.severity];
+        complete++;
+        if(f.evidence){
+          evidenceCount++;
+          out.notes.push(`${k[0].toUpperCase()+k.slice(1)}: ${f.evidence}`);
+        }
+      }
+    }else out[k]=null;
+  }
+  const defectList=Array.isArray(obj.defects)?obj.defects.map(x=>String(x).toLowerCase().replace(/[- ]/g,'_')):[];
+  for(const k of ['crease','dent','stain','scratch','printline','mark','possible_alteration'])out.defects[k]=defectList.includes(k);
+  const lr=parsePair(obj.center_lr??obj.centering?.lr),tb=parsePair(obj.center_tb??obj.centering?.tb);
+  const centerConfidence=clamp(Math.round(Number(obj.center_confidence??obj.centering?.confidence)||0),0,100);
+  if(lr&&tb)out.centering={lr,tb,confidence:centerConfidence};
+  const rawConfidence=clamp(Math.round(Number(obj.confidence)||0),0,100);
+  const q=Number.isFinite(Number(photoQuality))?clamp(Number(photoQuality),0,100):70;
+  let conf=complete===4 ? 48 + q*.28 + rawConfidence*.20 + Math.min(8,evidenceCount*2) : Math.min(35,rawConfidence);
+  if(defectList.length)conf-=3;
+  out.confidence=clamp(Math.round(conf),0,94);
+  out.rawModelConfidence=rawConfidence;
+  return sanitizeConditionAssessment(out);
+}
+function severityNeedsSecond(x){
+  if(!x||conditionCompleteness(x)<4||Number(x.confidence||0)<65)return true;
+  if(Object.values(x.defects||{}).some(Boolean))return true;
+  return ['corners','edges','surface','focus'].some(k=>{
+    const sev=x?.severity?.[k]||'unknown';
+    return (CONDITION_SEVERITY_RANK[sev]??99)>=2;
+  });
+}
+function mergeSeverityConsensus(a,b,side,photoQuality){
+  const out={side,defects:{},notes:[],severity:{},centering:{lr:null,tb:null,confidence:0},modelPath:'severity consensus'};
+  let agreements=0,known=0,conflicts=0;
+  for(const k of ['corners','edges','surface','focus']){
+    const as=a?.severity?.[k]||'unknown',bs=b?.severity?.[k]||'unknown';
+    const ar=CONDITION_SEVERITY_RANK[as]??99,br=CONDITION_SEVERITY_RANK[bs]??99;
+    let chosen='unknown';
+    if(ar===99&&br!==99)chosen=bs;
+    else if(br===99&&ar!==99)chosen=as;
+    else if(ar!==99&&br!==99){
+      known++;
+      if(Math.abs(ar-br)<=1){chosen=ar>=br?as:bs;agreements++}
+      else conflicts++;
+    }
+    out.severity[k]=chosen;
+    out[k]=chosen==='unknown'?null:CONDITION_SEVERITY_SCORE[chosen];
+  }
+  for(const k of ['crease','dent','stain','scratch','printline','mark','possible_alteration'])out.defects[k]=Boolean(a?.defects?.[k]||b?.defects?.[k]);
+  const pairClose=(p,q)=>Array.isArray(p)&&Array.isArray(q)&&Math.abs(Math.max(...p.map(Number))-Math.max(...q.map(Number)))<=6;
+  if(pairClose(a?.centering?.lr,b?.centering?.lr)&&pairClose(a?.centering?.tb,b?.centering?.tb)){
+    out.centering={lr:a.centering.lr,tb:a.centering.tb,confidence:Math.min(Number(a.centering.confidence||0),Number(b.centering.confidence||0))};
+  }
+  out.notes=Array.from(new Set([...(a?.notes||[]),...(b?.notes||[]),conflicts?'Disputed condition categories were withheld pending arbitration.':null].filter(Boolean))).slice(0,10);
+  const q=Number.isFinite(Number(photoQuality))?clamp(Number(photoQuality),0,100):70;
+  const base=conditionCompleteness(out)===4 ? 52 + q*.28 + (known?agreements/known*18:0) : 28;
+  out.confidence=clamp(Math.round(base-conflicts*10),0,92);
+  out.disputedFields=['corners','edges','surface','focus'].filter(k=>out[k]===null);
+  return sanitizeConditionAssessment(out);
+}
+async function runSeverityVision(env,model,side,image,photoQuality,targetFields=null){
+  const fields=targetFields?.length?targetFields:['corners','edges','surface','focus'];
+  const prompt=`Inspect ONLY visible physical condition on the ${side} of this raw trading card.
+For each requested category (${fields.join(', ')}), classify severity using ONLY:
+none, minute, minor, moderate, major, severe, unknown.
+
+Return ONLY JSON:
+{"corners":{"severity":"none|minute|minor|moderate|major|severe|unknown","evidence":string|null},
+"edges":{"severity":"...","evidence":string|null},
+"surface":{"severity":"...","evidence":string|null},
+"focus":{"severity":"...","evidence":string|null},
+"defects":["crease"|"dent"|"stain"|"scratch"|"printline"|"mark"|"possible_alteration"],
+"confidence":number,
+"center_lr":"55/45"|null,"center_tb":"52/48"|null,"center_confidence":number}
+
+Rules:
+- Do not identify the card.
+- Do not output numeric condition scores.
+- "none" means no visible defect at this photo resolution.
+- moderate/major/severe MUST name the visible defect in evidence.
+- focus means card print/registration, not camera sharpness.
+- Centering must be null unless a true printed outer frame/border is clearly measurable.
+- If uncertain, use unknown rather than guessing.`;
+  try{
+    let text='';
+    if(model===CONDITION_FALLBACK_MODEL){
+      const raw=await env.AI.run(model,{task:'query',image,question:prompt,reasoning:false,temperature:0,max_tokens:900,stream:false});
+      text=modelText(raw);
+    }else{
+      const raw=await env.AI.run(model,{messages:[
+        {role:'system',content:'You classify visible trading-card condition severity. Use categorical labels only and fail closed on uncertainty.'},
+        {role:'user',content:prompt}
+      ],image,temperature:0,max_tokens:900,stream:false});
+      text=modelText(raw);
+    }
+    const obj=parseModelJSON(text,'condition severity');
+    return conditionFromSeverityObject(obj,side,photoQuality,model===CONDITION_PRIMARY_MODEL?'Gemma 4 severity':'Moondream severity');
+  }catch(e){console.warn('Severity condition vision:',model,e);return null}
+}
+async function runSeverityArbitrator(env,side,image,photoQuality,fields){
+  if(!fields?.length)return null;
+  return runSeverityVision(env,CONDITION_PRIMARY_MODEL,side,image,photoQuality,fields);
+}
+
 async function inspectConditionSide(env, side, image, photoQuality=null) {
-  const question = `Inspect ONLY the visible physical condition of the ${side} of one raw trading card.
-Do not identify the card. Do not infer defects that are not visible. If something cannot be judged, return null.
+  // v6 primary path: models classify severity; Card Lab maps severity to scores.
+  // This prevents model-specific numeric-scale failures such as 1/1/1/1 with no defects.
+  const primary=await runSeverityVision(env,CONDITION_PRIMARY_MODEL,side,image,photoQuality);
+  if(primary && !severityNeedsSecond(primary))return primary;
 
-Return ONLY one JSON object:
-{"corners":number|null,"edges":number|null,"surface":number|null,"focus":number|null,"defects":["crease"|"dent"|"stain"|"scratch"|"printline"|"mark"|"possible_alteration"],"confidence":number,"center_lr":"55/45"|null,"center_tb":"52/48"|null,"center_confidence":number,"notes":["short visible evidence"]}
-
-Scores use 1-10 in 0.5 increments:
-10=no visible defect at this image resolution; 9-9.5=minute issue; 8-8.5=minor visible issue; 7-7.5=moderate visible issue. Below 7 requires a clearly visible named defect.
-FOCUS means card print/focus/registration, not camera sharpness.
-Centering is printed-design centering only and must be null unless a real printed border/design frame is clearly distinguishable from artwork.`;
-
-  let primary=null;
-  try{
-    const r=await runConditionPrimary(env,side,image,question);
-    primary=sanitizeConditionAssessment(parseConditionFlexible(r.text,side));
-    primary.modelPath='Gemma 4';
-  }catch(e){
-    console.warn('Primary condition model:',e);
-  }
-
-  if(primary && !conditionNeedsConsensus(primary)){
-    primary.confidence=calibrateConditionConfidence(primary,photoQuality,null);
-    primary.modelPath='Gemma 4';
-    return primary;
-  }
-
-  let fallback=null;
-  try{
-    const r=await runConditionFallback(env,side,image,question);
-    fallback=sanitizeConditionAssessment(parseConditionFlexible(r.text,side));
-    fallback.modelPath='Moondream 3.1';
-  }catch(e){
-    console.warn('Fallback condition model:',e);
-  }
-
-  if(primary && fallback && conditionCompleteness(primary)>=2 && conditionCompleteness(fallback)>=2){
-    let merged=sanitizeConditionAssessment(mergeConditionConsensus(primary,fallback,side,photoQuality));
-    if(conditionNeedsArbitration(merged)){
-      const disputed=['corners','edges','surface','focus'].filter(k=>{const m=conditionNumber(merged?.[k]),a=conditionNumber(primary?.[k]),b=conditionNumber(fallback?.[k]);return m===null||(a!==null&&b!==null&&Math.abs(a-b)>2)});
-      const arb=await runConditionArbitrator(env,side,image,disputed);
-      if(arb)merged=mergeConditionArbitration(merged,arb,side,photoQuality);
+  const fallback=await runSeverityVision(env,CONDITION_FALLBACK_MODEL,side,image,photoQuality);
+  if(primary&&fallback){
+    let merged=mergeSeverityConsensus(primary,fallback,side,photoQuality);
+    if(merged?.disputedFields?.length){
+      const arb=await runSeverityArbitrator(env,side,image,photoQuality,merged.disputedFields);
+      if(arb){
+        for(const k of merged.disputedFields){
+          if(arb[k]!=null){
+            merged[k]=arb[k];
+            merged.severity[k]=arb.severity?.[k]||merged.severity[k];
+          }
+        }
+        merged.notes=Array.from(new Set([...(merged.notes||[]),...(arb.notes||[]),'Targeted arbitration resolved only disputed condition categories.'])).slice(0,10);
+        if(conditionCompleteness(merged)===4)merged.confidence=clamp(Math.max(merged.confidence,62),0,92);
+        merged=sanitizeConditionAssessment(merged);
+      }
     }
-    return sanitizeConditionAssessment(merged);
+    return merged;
   }
-
-  const best=[primary,fallback].filter(Boolean).sort((a,b)=>conditionCompleteness(b)-conditionCompleteness(a)||Number(b.confidence||0)-Number(a.confidence||0))[0];
+  const best=primary||fallback;
   if(best){
-    best.confidence=calibrateConditionConfidence(best,photoQuality,null);
-    best.modelPath=best.modelPath||'single vision model';
-    if(conditionCompleteness(best)<4){
-      best.confidence=Math.min(best.confidence,30);
-      best.notes.push('Automatic condition score withheld where the available vision output was incomplete.');
-    }
+    if(conditionCompleteness(best)<4)best.confidence=Math.min(Number(best.confidence||0),34);
     return sanitizeConditionAssessment(best);
   }
 
-  return unknownConditionSide(side,'Both condition-vision paths were unavailable.');
+  // Last-resort compatibility path: retain the older numeric parser only if both
+  // categorical vision paths were unavailable.
+  const question=`Inspect ONLY visible physical condition of the ${side} of one raw trading card.
+Return ONLY JSON {"corners":number|null,"edges":number|null,"surface":number|null,"focus":number|null,"defects":[],"confidence":number,"center_lr":string|null,"center_tb":string|null,"center_confidence":number,"notes":[]}.
+Scores are 1-10; never use 1 as a placeholder; below 7 requires named visible damage; unknown values must be null.`;
+  try{
+    const r=await runConditionPrimary(env,side,image,question);
+    const legacy=sanitizeConditionAssessment(parseConditionFlexible(r.text,side));
+    if(legacy){
+      legacy.modelPath='legacy numeric emergency fallback';
+      legacy.confidence=Math.min(calibrateConditionConfidence(legacy,photoQuality,null),55);
+      return legacy;
+    }
+  }catch(e){console.warn('Emergency numeric condition fallback:',e)}
+  return unknownConditionSide(side,'All condition-vision paths were unavailable.');
 }
 
 
@@ -1475,6 +1645,47 @@ Ignore the physical photo background and internal artwork lines. Return ONLY JSO
     return {lr,tb,confidence,reason:clean(obj?.reason)||'reference-template visual centering'};
   }catch(e){console.warn('Reference centering:',e);return null}
 }
+async function inspectCenteringIndependent(env,side,image,identity,template=null){
+  const ref=template?`Verified design template: ${JSON.stringify({border_style:template.border_style,measurable_frame:template.measurable_frame,notes:template.notes})}`:'No verified reference template is available.';
+  const prompt=`Measure ONLY printed-design centering on the ${side} of this photographed trading card.
+Known core identity: ${JSON.stringify({year:identity?.year,set:identity?.set,subject:identity?.subject,cardNo:identity?.cardNo})}
+${ref}
+
+First locate the physical card rectangle. Then locate the intended OUTERMOST printed frame/border. Ignore photo background, shadows, internal artwork boxes, logos, stat boxes, and decorative inner lines.
+Return ONLY JSON {"measurable":boolean,"lr":"55/45"|null,"tb":"52/48"|null,"confidence":number,"reason":string}.
+If borderless, ambiguous, perspective-distorted, or the outer printed frame cannot be distinguished, measurable=false.
+Do not guess.`;
+  try{
+    const raw=await env.AI.run(CONDITION_PRIMARY_MODEL,{messages:[
+      {role:'system',content:'You are a conservative card-geometry measurer. Use only the true outer printed frame and fail closed when ambiguous.'},
+      {role:'user',content:prompt}
+    ],image,temperature:0,max_tokens:450,stream:false});
+    const obj=structuredModelResult(raw,'independent centering');
+    if(!obj?.measurable)return null;
+    const lr=parsePair(obj.lr),tb=parsePair(obj.tb),confidence=clamp(Math.round(Number(obj.confidence)||0),0,100);
+    if(!lr||!tb||confidence<76)return null;
+    const extreme=Math.max(...lr,...tb)>70;
+    if(extreme&&confidence<90)return null;
+    return {lr,tb,confidence,reason:clean(obj.reason)||'independent vision geometry'};
+  }catch(e){console.warn('Independent centering:',e);return null}
+}
+
+async function rescueCenteringEvidence(env,front,back,condition,identity,template,localCentering){
+  if(!condition?.sides)return condition;
+  const jobs=[];
+  for(const [side,img] of [['front',front],['back',back]]){
+    const existing=condition?.sides?.[side]?.centering;
+    const existingOK=existing?.lr&&existing?.tb&&Number(existing.confidence||0)>=76;
+    const need=centeringNeedsReference(localCentering?.[side])&&!existingOK;
+    jobs.push(need?inspectCenteringIndependent(env,side,img,identity,template):Promise.resolve(null));
+  }
+  const [fc,bc]=await Promise.all(jobs);
+  if(fc)condition.sides.front.centering=fc;
+  if(bc)condition.sides.back.centering=bc;
+  if(fc||bc)condition.notes=Array.from(new Set([...(condition.notes||[]),'Independent centering rescue was used only where local geometry could not establish a reliable result.'])).slice(0,10);
+  return condition;
+}
+
 async function refineCenteringWithReference(env,front,back,condition,template,localCentering){
   if(!condition?.sides)return condition;
   const jobs=[];
@@ -2001,6 +2212,20 @@ function runSelfTests(){
 
   const mq=buildMarketQueries({year:2026,set:'Topps Flagship 1991 Topps Football',subject:'Travis Hunter',cardNo:'91TF-2',variation:null});
   add('adaptive market search creates exact and safe broader queries',mq.length>=2&&mq[0].includes('91TF-2')&&mq.every(x=>x.includes('Travis Hunter')||x.includes('91TF-2')),mq);
+
+  const sev=conditionFromSeverityObject({
+    corners:{severity:'none',evidence:'four corners appear sharp'},
+    edges:{severity:'minute',evidence:'tiny white speck on lower edge'},
+    surface:{severity:'minor',evidence:'light visible surface mark'},
+    focus:{severity:'none',evidence:'print registration appears clean'},
+    defects:[],confidence:82,center_lr:'51/49',center_tb:'52/48',center_confidence:80
+  },'front',95,'test');
+  add('categorical severity maps deterministically to grading scores',sev.corners===10&&sev.edges===9.5&&sev.surface===8.5&&sev.focus===10,sev);
+
+  const sevBad=conditionFromSeverityObject({
+    corners:{severity:'major',evidence:null},edges:{severity:'none'},surface:{severity:'none'},focus:{severity:'none'},defects:[],confidence:95
+  },'front',95,'test');
+  add('major condition severity without named evidence fails closed',sevBad.corners===null,sevBad);
 
   return {ok:tests.every(x=>x.pass),passed:tests.filter(x=>x.pass).length,total:tests.length,tests};
 }
